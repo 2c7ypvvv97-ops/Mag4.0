@@ -1,0 +1,9 @@
+MagazzinoStandalone/
+│
+├── app.py                  # Entrypoint: Login, controllo licenza, sessione, KPI e layout
+├── licenza.py              # Gestione cifratura, verifica e controllo scadenza licenza
+├── db.py                   # SQLite (WAL mode, query ottimizzate, anagrafiche, movimenti e utenti)
+├── magazzino.py            # Core UX: Stock live, carico/scarico, rettifiche e sotto scorta
+├── clienti.py              # Anagrafica clienti leggera per destinazioni uscite
+├── etichette_pdf.py        # Generatore PDF etichette (Barcode Code128 / QR Code) e report
+└── backup.py               # Backup cifrato AES-256 (.enc) e ripristino sicuro
