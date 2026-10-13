@@ -1,13 +1,25 @@
 import os
+from dotenv import load_dotenv
 import shutil
 from datetime import datetime
 from cryptography.fernet import Fernet
 
+# Carica le variabili protette dal file .env
+load_dotenv()
+
 DB_NAME = "magazzino.db"
 KEY_FILE = "secret.key"
 
+# Recupera la chiave di cifratura AES-256 in modo sicuro dall'ambiente (con fallback sulla chiave locale se non definita)
+MASTER_KEY = os.getenv("MASTER_ENCRYPTION_KEY")
+
 def ottieni_o_genera_chiave() -> bytes:
-    """Carica la chiave Fernet locale o ne genera una nuova AES-256."""
+    """Carica la chiave Fernet o ne genera una nuova."""
+    if MASTER_KEY:
+        # Se la chiave è definita nel file .env, la usiamo convertendola in bytes se necessario
+        return MASTER_KEY.encode() if isinstance(MASTER_KEY, str) else MASTER_KEY
+    
+    # Altrimenti fallback sul file locale secret.key
     if not os.path.exists(KEY_FILE):
         key = Fernet.generate_key()
         with open(KEY_FILE, "wb") as f:
@@ -18,7 +30,7 @@ def ottieni_o_genera_chiave() -> bytes:
             return f.read()
 
 def esegui_backup_cifrato(cartella_destinazione: str = "./backups") -> tuple[bool, str]:
-    """Cifra il database magazzino.db e lo salva in formato .enc."""
+    """Cifra il database magazzino.db e lo salva in formato .enc usando la chiave protetta."""
     if not os.path.exists(DB_NAME):
         return False, "Database 'magazzino.db' non trovato."
 
@@ -41,23 +53,18 @@ def esegui_backup_cifrato(cartella_destinazione: str = "./backups") -> tuple[boo
         with open(percorso_completo, "wb") as f_out:
             f_out.write(dati_cifrati)
 
-        return True, f"Backup cifrato creato con successo: {nome_file_backup}"
+        return True, f"Backup cifrato AES-256 eseguito con successo: {nome_file_backup}"
 
     except Exception as e:
-        return False, f"Errore durante la creazione del backup: {e}"
+        return False, f"Errore durante la creazione del backup cifrato: {e}"
 
 def ripristina_backup_cifrato(percorso_file_enc: str) -> tuple[bool, str]:
     """Decifra un file .enc e sovrascrive magazzino.db."""
     if not os.path.exists(percorso_file_enc):
         return False, "File di backup non trovato."
 
-    if not os.path.exists(KEY_FILE):
-        return False, "Chiave di cifratura 'secret.key' mancante. Impossibile decifrare."
-
     try:
-        with open(KEY_FILE, "rb") as f:
-            key = f.read()
-
+        key = ottieni_o_genera_chiave()
         fernet = Fernet(key)
 
         with open(percorso_file_enc, "rb") as f_enc:

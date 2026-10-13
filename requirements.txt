@@ -1,13 +1,8 @@
 streamlit>=1.30.0
-
 pandas>=2.0.0
-
 reportlab>=4.0.0
-
 python-barcode>=0.15.0
-
 pillow>=10.0.0
-
+bcrypt>=4.0.0
 cryptography>=41.0.0
-
-qrcode>=7.4.2
+python-dotenv>=1.0.0
