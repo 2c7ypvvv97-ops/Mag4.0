@@ -1,30 +1,43 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-from db import get_db_connection
+from db import get_db_connection, get_tutte_zone, registra_zona_al_volo
 from clienti import get_tutti_clienti
 from etichette_pdf import genera_pdf_etichetta_singola, genera_pdf_lista_riordino
 
-def get_ubicazione_articolo(pn_codice: str) -> str:
-    """Recupera l'ubicazione dal database se l'articolo esiste già."""
+# Import sicuro per la gestione ZPL
+try:
+    from etichette_pdf import genera_zpl_etichetta, invia_a_stampante_zebra
+except ImportError:
+    def genera_zpl_etichetta(pn_codice, descrizione, ubicazione):
+        return f"^XA^FO50,50^A0N,36,36^FD{pn_codice}^FS^XZ"
+    def invia_a_stampante_zebra(ip, zpl, porta=9100):
+        return False
+
+def get_ubicazione_articolo(pn_codice: str):
+    """Recupera l'ubicazione e la zona dal database se l'articolo esiste già."""
     if not pn_codice:
-        return "SCAFFALE-A1"
+        return "SCAFFALE-A1", "Generale"
     conn = get_db_connection()
     ubicazione = "SCAFFALE-A1"
+    zona = "Generale"
     if conn:
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT ubicazione FROM part_numbers WHERE pn_codice = ?", (pn_codice.strip().upper(),))
+            cursor.execute("SELECT ubicazione, zona FROM part_numbers WHERE pn_codice = ?", (pn_codice.strip().upper(),))
             row = cursor.fetchone()
-            if row and row['ubicazione']:
-                ubicazione = row['ubicazione']
+            if row:
+                if row['ubicazione']:
+                    ubicazione = row['ubicazione']
+                if row['zona']:
+                    zona = row['zona']
         except Exception:
             pass
         finally:
             conn.close()
-    return ubicazione
+    return ubicazione, zona
 
-def get_stock_completo(filtro_ricerca: str = "", filtro_stato: str = "Tutti"):
+def get_stock_completo(filtro_ricerca: str = "", filtro_stato: str = "Tutti", filtro_zona: str = "Tutte"):
     conn = get_db_connection()
     rows = []
     if conn:
@@ -33,7 +46,9 @@ def get_stock_completo(filtro_ricerca: str = "", filtro_stato: str = "Tutti"):
             query = """
                 SELECT 
                     pn.pn_codice, pn.descrizione, pn.categoria, pn.ubicazione, 
+                    COALESCE(pn.zona, 'Generale') AS zona,
                     pn.scorta_minima, pn.lotto_riordino, pn.fornitore_abituale,
+                    COALESCE(pn.alta_rotazione, 0) AS alta_rotazione,
                     COALESCE(mq.quantita_disponibile, 0) AS giacenza,
                     mq.data_ultimo_aggiornamento
                 FROM part_numbers pn
@@ -54,6 +69,10 @@ def get_stock_completo(filtro_ricerca: str = "", filtro_stato: str = "Tutti"):
             elif filtro_stato == "Esauriti":
                 conditions.append("COALESCE(mq.quantita_disponibile, 0) = 0")
 
+            if filtro_zona and filtro_zona != "Tutte":
+                conditions.append("COALESCE(pn.zona, 'Generale') = ?")
+                params.append(filtro_zona)
+
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
 
@@ -66,6 +85,31 @@ def get_stock_completo(filtro_ricerca: str = "", filtro_stato: str = "Tutti"):
             conn.close()
     return rows
 
+def get_articoli_sotto_scorta_con_rotazione():
+    conn = get_db_connection()
+    rows = []
+    if conn:
+        try:
+            cursor = conn.cursor()
+            query = """
+                SELECT 
+                    pn.pn_codice, pn.descrizione, pn.ubicazione, COALESCE(pn.zona, 'Generale') AS zona,
+                    pn.scorta_minima, pn.fornitore_abituale,
+                    COALESCE(pn.alta_rotazione, 0) AS alta_rotazione,
+                    COALESCE(mq.quantita_disponibile, 0) AS giacenza
+                FROM part_numbers pn
+                LEFT JOIN magazzino_quantita mq ON pn.pn_codice = mq.pn_codice
+                WHERE COALESCE(mq.quantita_disponibile, 0) <= pn.scorta_minima
+                ORDER BY pn.alta_rotazione DESC, pn.pn_codice ASC
+            """
+            cursor.execute(query)
+            rows = [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            st.error(f"Errore lettura sotto scorta: {e}")
+        finally:
+            conn.close()
+    return rows
+
 def get_movimenti_storico(data_inizio, data_fine, filtro_pn=""):
     conn = get_db_connection()
     movimenti = []
@@ -74,7 +118,8 @@ def get_movimenti_storico(data_inizio, data_fine, filtro_pn=""):
             cursor = conn.cursor()
             query = """
                 SELECT m.id, m.pn_codice, m.tipo_movimento, m.quantita, m.causale, 
-                       c.ragione_sociale AS cliente, m.numero_ddt, m.data_ddt, m.ubicazione, m.operatore, m.note, m.data_ora
+                       c.ragione_sociale AS cliente, m.numero_ddt, m.data_ddt, m.ubicazione, 
+                       COALESCE(m.zona, 'Generale') AS zona, m.operatore, m.note, m.data_ora
                 FROM storico_movimenti m
                 LEFT JOIN clienti c ON m.codice_cliente = c.codice_cliente
                 WHERE DATE(m.data_ora) BETWEEN ? AND ?
@@ -101,26 +146,33 @@ def render():
     utente = st.session_state.get("utente_loggato", {})
     nome_operatore = utente.get("nome_completo", utente.get("username", "OPERATORE")).upper()
 
+    # Recuperiamo preventivamente i dati del sotto scorta per calcolare il badge numerico
+    stock_sotto_scorta = get_articoli_sotto_scorta_con_rotazione()
+    num_critici = len(stock_sotto_scorta)
+    badge_text = f" ⚠️ ({num_critici})" if num_critici > 0 else ""
+
     tab_stock, tab_movimenti, tab_sotto_scorta, tab_storico = st.tabs([
         "📋 Stock Live & Giacenze", 
         "🔄 Movimentazione (Carico/Scarico/Rettifica)", 
-        "⚠️ Sotto Scorta & Riordini",
+        f"🚨 Sotto Scorta & Riordini{badge_text}",
         "📜 Registro Movimenti"
     ])
 
     # --- TAB 1: STOCK LIVE ---
     with tab_stock:
-        col_f1, col_f2 = st.columns([3, 1.5])
+        col_f1, col_f2, col_f3 = st.columns([2.5, 1.5, 1.5])
         with col_f1:
             ricerca = st.text_input("🔍 Ricerca rapida (PN, Descrizione, Ubicazione, Categoria)", placeholder="Digita per cercare...", key="input_ricerca_stock").strip()
         with col_f2:
             stato_sel = st.selectbox("Filtra per Stato:", ["Tutti", "Disponibili", "Sotto Scorta", "Esauriti"], key="select_stato_stock")
+        with col_f3:
+            elenco_zone_filtro = ["Tutte"] + get_tutte_zone()
+            zona_sel = st.selectbox("Filtra per Zona:", elenco_zone_filtro, key="select_zona_stock")
 
-        # Evitiamo la tabella pesante fissa all'avvio se non si sta cercando nulla
-        if not ricerca:
-            st.info("💡 Digita almeno un carattere nella barra di ricerca sopra per visualizzare gli articoli in magazzino ed evitare rallentamenti.")
+        if not ricerca and zona_sel == "Tutte":
+            st.info("💡 Digita almeno un carattere nella barra di ricerca o seleziona una zona specifica per visualizzare gli articoli in magazzino.")
         else:
-            stock_data = get_stock_completo(ricerca, stato_sel)
+            stock_data = get_stock_completo(ricerca, stato_sel, zona_sel)
 
             if stock_data:
                 df_stock = pd.DataFrame(stock_data)
@@ -129,8 +181,10 @@ def render():
                     "descrizione": "Descrizione",
                     "categoria": "Categoria",
                     "ubicazione": "Ubicazione",
+                    "zona": "Zona",
                     "giacenza": "Giacenza",
                     "scorta_minima": "Scorta Min.",
+                    "alta_rotazione": "Alta Rotazione",
                     "fornitore_abituale": "Fornitore"
                 })
                 st.dataframe(df_display, use_container_width=True, hide_index=True)
@@ -165,8 +219,22 @@ def render():
                 pn_in = st.text_input("Part Number (PN) *").strip().upper()
                 qta_in = st.number_input("Quantità *", min_value=1, value=1, step=1)
             with col_b:
-                ubic_sugg = get_ubicazione_articolo(pn_in) if pn_in else "SCAFFALE-A1"
+                ubic_sugg, zona_sugg = get_ubicazione_articolo(pn_in) if pn_in else ("SCAFFALE-A1", "Generale")
                 ubic_in = st.text_input("Ubicazione Magazzino *", value=ubic_sugg).strip().upper()
+                
+                # Gestione Zona con autocompletamento / inserimento dinamico
+                zone_esistenti = get_tutte_zone()
+                zona_input_scelta = st.selectbox(
+                    "Zona Logistica", 
+                    options=zone_esistenti + ["➕ Nuova Zona..."],
+                    index=zone_esistenti.index(zona_sugg) if zona_sugg in zone_esistenti else 0
+                )
+                
+                if zona_input_scelta == "➕ Nuova Zona...":
+                    zona_in = st.text_input("Digita Nome Nuova Zona:").strip().upper()
+                else:
+                    zona_in = zona_input_scelta
+
                 st.text_input("Operatore", value=nome_operatore, disabled=True)
 
             causale_in = ""
@@ -174,6 +242,7 @@ def render():
             numero_ddt_in = ""
             data_ddt_in = datetime.now()
             note_in = ""
+            alta_rot_in = 0
 
             if "SCARICO" in tipo_op:
                 col_s1, col_s2, col_s3 = st.columns(3)
@@ -201,6 +270,9 @@ def render():
                 with col_c3:
                     numero_ddt_in = st.text_input("N. DDT Fornitore *").strip()
                     data_ddt_in = st.date_input("Data DDT Fornitore", value=datetime.now())
+                
+                alta_rot_bool = st.checkbox("🔥 Articolo ad Alta Rotazione", value=False)
+                alta_rot_in = 1 if alta_rot_bool else 0
 
             elif "RETTIFICA" in tipo_op:
                 note_in = st.text_input("Motivo della Rettifica *", placeholder="Es. Conteggio Inventario / Errore precedente").strip()
@@ -213,6 +285,9 @@ def render():
                 elif "RETTIFICA" in tipo_op and not note_in:
                     st.error("Inserisci la motivazione per la rettifica.")
                 else:
+                    # Registra la zona al volo se nuova
+                    zona_finale = registra_zona_al_volo(zona_in if zona_in else "Generale")
+
                     conn = get_db_connection()
                     if conn:
                         try:
@@ -221,12 +296,14 @@ def render():
                             # 1. Se CARICO e l'articolo non esiste, crea anagrafica
                             if "CARICO" in tipo_op:
                                 cursor.execute("""
-                                    INSERT INTO part_numbers (pn_codice, descrizione, categoria, ubicazione, scorta_minima, fornitore_abituale)
-                                    VALUES (?, ?, ?, ?, ?, ?)
+                                    INSERT INTO part_numbers (pn_codice, descrizione, categoria, ubicazione, zona, scorta_minima, fornitore_abituale, alta_rotazione)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                     ON CONFLICT(pn_codice) DO UPDATE SET
                                         descrizione=COALESCE(EXCLUDED.descrizione, part_numbers.descrizione),
-                                        ubicazione=EXCLUDED.ubicazione
-                                """, (pn_in, desc_in if desc_in else f"Articolo {pn_in}", cat_in, ubic_in, scorta_min_in, forn_in))
+                                        ubicazione=EXCLUDED.ubicazione,
+                                        zona=EXCLUDED.zona,
+                                        alta_rotazione=EXCLUDED.alta_rotazione
+                                """, (pn_in, desc_in if desc_in else f"Articolo {pn_in}", cat_in, ubic_in, zona_finale, scorta_min_in, forn_in, alta_rot_in))
 
                             # 2. Controllo e aggiornamento giacenza
                             cursor.execute("SELECT quantita_disponibile FROM magazzino_quantita WHERE pn_codice = ?", (pn_in,))
@@ -247,29 +324,78 @@ def render():
                                 tipo_m = "RETTIFICA"
 
                             cursor.execute("""
-                                INSERT INTO magazzino_quantita (pn_codice, quantita_disponibile, ubicazione, operatore, data_ultimo_aggiornamento)
-                                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                INSERT INTO magazzino_quantita (pn_codice, quantita_disponibile, ubicazione, zona, operatore, data_ultimo_aggiornamento)
+                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                                 ON CONFLICT(pn_codice) DO UPDATE SET
                                     quantita_disponibile = EXCLUDED.quantita_disponibile,
                                     ubicazione = EXCLUDED.ubicazione,
+                                    zona = EXCLUDED.zona,
                                     operatore = EXCLUDED.operatore,
                                     data_ultimo_aggiornamento = CURRENT_TIMESTAMP
-                            """, (pn_in, nuova_qta, ubic_in, nome_operatore))
+                            """, (pn_in, nuova_qta, ubic_in, zona_finale, nome_operatore))
 
-                            # 3. Registrazione Audit Log con DDT
+                            # 3. Registrazione Audit Log con DDT e Zona
                             str_data_ddt = data_ddt_in.strftime('%Y-%m-%d') if data_ddt_in else None
                             cursor.execute("""
-                                INSERT INTO storico_movimenti (pn_codice, tipo_movimento, quantita, causale, codice_cliente, numero_ddt, data_ddt, ubicazione, operatore, note)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (pn_in, tipo_m, qta_in, causale_in, cliente_in, numero_ddt_in if numero_ddt_in else None, str_data_ddt, ubic_in, nome_operatore, note_in))
+                                INSERT INTO storico_movimenti (pn_codice, tipo_movimento, quantita, causale, codice_cliente, numero_ddt, data_ddt, ubicazione, zona, operatore, note)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (pn_in, tipo_m, qta_in, causale_in, cliente_in, numero_ddt_in if numero_ddt_in else None, str_data_ddt, ubic_in, zona_finale, nome_operatore, note_in))
 
                             conn.commit()
-                            st.success(f"Operazione completata! Nuova giacenza per **{pn_in}**: **{nuova_qta} pz**.")
+                            st.session_state["ultimo_pn_caricato"] = pn_in
+                            st.session_state["ultima_desc_caricata"] = desc_in if ('desc_in' in locals() and desc_in) else f"Articolo {pn_in}"
+                            st.session_state["ultima_ubic_caricata"] = ubic_in
+
+                            st.success(f"Operazione completata! Nuova giacenza per **{pn_in}**: **{nuova_qta} pz** (Zona: {zona_finale}).")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Errore operazione: {e}")
                         finally:
                             conn.close()
+
+        # Blocco opzioni di stampa per l'ultimo articolo registrato
+        if "ultimo_pn_caricato" in st.session_state:
+            st.markdown("---")
+            st.info(f"✨ Ultimo articolo registrato/caricato: **{st.session_state['ultimo_pn_caricato']}**. Scegli la modalità di stampa:")
+            
+            modalita_stampa = st.radio(
+                "Modalità di stampa etichetta:", 
+                ["📥 Scarica PDF Standard", "🏷️ Stampa Diretta su Stampante Termica (Zebra IP)"],
+                horizontal=True,
+                key="radio_modalita_stampa"
+            )
+            
+            if "PDF" in modalita_stampa:
+                pdf_bytes_nuovo = genera_pdf_etichetta_singola(
+                    st.session_state["ultimo_pn_caricato"], 
+                    st.session_state["ultima_desc_caricata"], 
+                    st.session_state["ultima_ubic_caricata"]
+                )
+                st.download_button(
+                    label=f"🖨️ Scarica Etichetta PDF per {st.session_state['ultimo_pn_caricato']}",
+                    data=pdf_bytes_nuovo,
+                    file_name=f"Etichetta_{st.session_state['ultimo_pn_caricato']}.pdf",
+                    mime="application/pdf",
+                    type="primary"
+                )
+            else:
+                ip_attuale_global = st.session_state.get("ip_stampante_zebra_globale", "192.168.1.50")
+                col_ip, col_btn_zpl = st.columns([2, 1])
+                with col_ip:
+                    ip_zebra = st.text_input("Indirizzo IP Stampante Zebra:", value=ip_attuale_global, key="ip_zebra_input")
+                with col_btn_zpl:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("🚀 Invia a Stampante", type="primary"):
+                        zpl_string = genera_zpl_etichetta(
+                            st.session_state["ultimo_pn_caricato"], 
+                            st.session_state["ultima_desc_caricata"], 
+                            st.session_state["ultima_ubic_caricata"]
+                        )
+                        successo = invia_a_stampante_zebra(ip_zebra, zpl_string)
+                        if successo:
+                            st.success("Etichetta inviata con successo alla stampante termica!")
+                        else:
+                            st.error("Impossibile connettersi alla stampante. Verifica l'indirizzo IP.")
 
     # --- TAB 3: SOTTO SCORTA & RIORDINI ---
     with tab_sotto_scorta:
@@ -288,12 +414,27 @@ def render():
                 st.session_state["mostra_sotto_scorta"] = False
                 st.rerun()
 
-            stock_tutto = get_stock_completo(filtro_stato="Sotto Scorta")
-            if stock_tutto:
-                df_ss = pd.DataFrame(stock_tutto)
-                st.dataframe(df_ss[["pn_codice", "descrizione", "giacenza", "scorta_minima", "fornitore_abituale"]], use_container_width=True, hide_index=True)
+            if stock_sotto_scorta:
+                df_ss = pd.DataFrame(stock_sotto_scorta)
                 
-                pdf_riordino = genera_pdf_lista_riordino(stock_tutto)
+                df_alta_rot = df_ss[df_ss['alta_rotazione'] == 1]
+                if not df_alta_rot.empty:
+                    st.warning(f"🔥 **ATTENZIONE**: Ci sono {len(df_alta_rot)} articoli ad **Alta Rotazione** sotto scorta!")
+                    st.dataframe(
+                        df_alta_rot[["pn_codice", "descrizione", "ubicazione", "zona", "giacenza", "scorta_minima", "fornitore_abituale"]], 
+                        use_container_width=True, 
+                        hide_index=True
+                    )
+                    st.markdown("---")
+
+                st.subheader("📋 Lista Completa Riordino")
+                st.dataframe(
+                    df_ss[["pn_codice", "descrizione", "ubicazione", "zona", "giacenza", "scorta_minima", "alta_rotazione", "fornitore_abituale"]], 
+                    use_container_width=True, 
+                    hide_index=True
+                )
+                
+                pdf_riordino = genera_pdf_lista_riordino(stock_sotto_scorta)
                 st.download_button(
                     "📥 Scarica Lista Riordino (PDF)",
                     data=pdf_riordino,
@@ -332,6 +473,7 @@ def render():
                     "numero_ddt": "N. DDT",
                     "data_ddt": "Data DDT",
                     "ubicazione": "Ubicazione",
+                    "zona": "Zona",
                     "operatore": "Operatore",
                     "note": "Note",
                     "data_ora": "Data/Ora"

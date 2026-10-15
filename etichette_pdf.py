@@ -5,6 +5,34 @@ from barcode.writer import ImageWriter
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
+import socket
+
+def genera_zpl_etichetta(pn_codice: str, descrizione: str, ubicazione: str) -> str:
+    """Genera il codice ZPL nativo per stampanti termiche Zebra."""
+    # Formato standard etichetta (es. 100x50 mm o simile)
+    zpl = f"""
+^XA
+^PW800
+^LL400
+^FO50,50^A0N,36,36^FDPart Number:^FS
+^FO250,50^A0N,40,40^FB500,1,0,L^FD{pn_codice}^FS
+^FO50,110^BY2,3,70^BCN,70,Y,N,N^FD{pn_codice}^FS
+^FO50,210^A0N,30,30^FDDesc: {descrizione[:35]}^FS
+^FO50,260^A0N,36,36^FDUbicazione: {ubicazione}^FS
+^XZ
+"""
+    return zpl.strip()
+
+def invia_a_stampante_zebra(ip_stampante: str, zpl_data: str, porta: int = 9100) -> bool:
+    """Invia direttamente il codice ZPL alla stampante Zebra tramite la rete locale."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(3)
+            s.connect((ip_stampante, porta))
+            s.sendall(zpl_data.encode('utf-8'))
+        return True
+    except Exception as e:
+        return False
 
 def genera_qr_code_image(testo: str) -> io.BytesIO:
     """Genera l'immagine PNG del QR Code in memoria."""

@@ -105,10 +105,17 @@ def render_cambio_password_forzato():
                 else:
                     st.error(msg)
 
+# Definizione della Funzione Admin con la nuova tab per le Zone
 def render_gestione_admin():
     st.title("🛡️ Amministrazione Utenti & Sicurezza")
     
-    tab_u, tab_b = st.tabs(["👥 Gestione Utenti & Reset", "💾 Backup & Sicurezza"])
+    tab_u, tab_log, tab_zone, tab_b, tab_stampa = st.tabs([
+        "👥 Gestione Utenti & Reset", 
+        "📜 Audit Trail & Log Sicurezza", 
+        "🗺️ Bonifica & Gestione Zone",
+        "⚙️ Timeout & Backup (AES-256)",
+        "🖨️ Configurazione Stampante"
+    ])
 
     with tab_u:
         st.subheader("Utenti Registrati e Stato Account")
@@ -131,7 +138,8 @@ def render_gestione_admin():
         with col_r2:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("🔑 Genera Password Temporanea", type="secondary"):
-                ok, res_msg = db.reset_password_admin(username_da_resettare)
+                admin_corrente = st.session_state["utente_loggato"]["username"]
+                ok, res_msg = db.reset_password_admin(username_da_resettare, admin_esecutore=admin_corrente)
                 if ok:
                     st.success(f"Password temporanea generata per **{username_da_resettare}**:")
                     st.code(res_msg, language="text")
@@ -149,7 +157,8 @@ def render_gestione_admin():
 
             if st.form_submit_button("Crea Account", type="primary"):
                 if u_name and u_full and u_pwd:
-                    ok, msg = db.crea_utente(u_name, u_pwd, u_full, u_role)
+                    admin_corrente = st.session_state["utente_loggato"]["username"]
+                    ok, msg = db.crea_utente(u_name, u_pwd, u_full, u_role, admin_esecutore=admin_corrente)
                     if ok:
                         st.success(msg)
                         st.rerun()
@@ -157,6 +166,52 @@ def render_gestione_admin():
                         st.error(msg)
                 else:
                     st.warning("Tutti i campi sono obbligatori.")
+
+    with tab_log:
+        st.subheader("📜 Cronologia Immutabile degli Eventi (Audit Trail)")
+        st.caption("Registro ufficiale di tutte le azioni amministrative e di sicurezza eseguite sul sistema.")
+        
+        logs = db.get_log_amministrazione()
+        if logs:
+            df_logs = pd.DataFrame(logs).rename(columns={
+                "id": "ID",
+                "username_admin": "Esecutore",
+                "azione": "Tipo Azione",
+                "dettagli": "Dettagli Operazione",
+                "data_ora": "Data e Ora"
+            })
+            st.dataframe(df_logs, use_container_width=True, hide_index=True)
+        else:
+            st.info("Nessun evento registrato al momento.")
+
+    with tab_zone:
+        st.subheader("🗺️ Bonifica e Unione Zone di Magazzino")
+        st.caption("Usa questo pannello per correggere errori di digitazione, refusi o unire due zone create per errore in un'unica zona corretta su tutti gli articoli.")
+        
+        elenco_zone = db.get_tutte_zone()
+        if not elenco_zone:
+            st.info("Nessuna zona registrata nel sistema.")
+        else:
+            with st.form("form_bonifica_zona"):
+                col_z1, col_z2 = st.columns(2)
+                with col_z1:
+                    zona_da_correggere = st.selectbox("Seleziona Zona da Correggere / Unire:", elenco_zone)
+                with col_z2:
+                    nuova_zona_nome = st.text_input("Nuovo Nome Corretto (o Zona di destinazione):").strip().upper()
+
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.form_submit_button("🚀 Esegui Bonifica e Aggiorna Articoli", type="primary", use_container_width=True):
+                    if not nuova_zona_nome:
+                        st.error("Inserisci il nome della zona corretta.")
+                    else:
+                        admin_corrente = st.session_state["utente_loggato"]["username"]
+                        ok_b, msg_b = db.bonifica_e_unisci_zone(zona_da_correggere, nuova_zona_nome, admin_esecutore=admin_corrente)
+                        if ok_b:
+                            st.success(msg_b)
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error(msg_b)
 
     with tab_b:
         st.subheader("⏱️ Configurazione Timeout di Inattività")
@@ -182,6 +237,23 @@ def render_gestione_admin():
                 st.success(msg)
             else:
                 st.error(msg)
+                
+    with tab_stampa:
+        st.subheader("🏷️ Configurazione Stampante Termica (Zebra / IP)")
+        st.caption("Imposta l'indirizzo IP della stampante termica di rete utilizzata per la stampa diretta delle etichette nei reparti.")
+        
+        ip_attuale = st.session_state.get("ip_stampante_zebra_globale", "192.168.1.50")
+        
+        with st.form("form_config_stampante"):
+            nuovo_ip_zebra = st.text_input(
+                "Indirizzo IP Stampante Zebra (Porta 9100 standard):", 
+                value=ip_attuale,
+                placeholder="Es. 192.168.1.200"
+            ).strip()
+            
+            if st.form_submit_button("💾 Salva Indirizzo IP Stampante", type="primary"):
+                st.session_state["ip_stampante_zebra_globale"] = nuovo_ip_zebra
+                st.success(f"Indirizzo IP della stampante aggiornato con successo a **{nuovo_ip_zebra}**!")
 
 # --- FLUSSO APPLICAZIONE ---
 if st.session_state["utente_loggato"] is None:
@@ -245,106 +317,3 @@ else:
         clienti.render()
     elif scelta == "🛡️ Admin & Backup" and ruolo == "Admin":
         render_gestione_admin()
-        
-def render_gestione_admin():
-    st.title("🛡️ Amministrazione Utenti & Sicurezza")
-    
-    # Creiamo tab dedicate: Gestione Utenti, Audit Trail (Log), Timeout e Backup
-    tab_u, tab_log, tab_b = st.tabs([
-        "👥 Gestione Utenti & Reset", 
-        "📜 Audit Trail & Log Sicurezza", 
-        "⚙️ Timeout & Backup (AES-256)"
-    ])
-
-    with tab_u:
-        st.subheader("Utenti Registrati e Stato Account")
-        utenti = db.get_tutti_utenti()
-        df_utenti = pd.DataFrame(utenti).rename(columns={
-            "username": "Username",
-            "nome_completo": "Nome Completo",
-            "ruolo": "Ruolo",
-            "tentativi_falliti": "Tentativi Falliti",
-            "account_bloccato": "Bloccato",
-            "cambio_password_richiesto": "Cambio Psw Obbligatorio"
-        })
-        st.dataframe(df_utenti, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        st.subheader("🔄 Azioni Amministrative (Reset Password)")
-        col_r1, col_r2 = st.columns([2, 1])
-        with col_r1:
-            username_da_resettare = st.selectbox("Seleziona Utente per Reset Password:", [u["username"] for u in utenti])
-        with col_r2:
-            st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("🔑 Genera Password Temporanea", type="secondary"):
-                # Passiamo l'username dell'admin attualmente loggato per tracciarlo nei log
-                admin_corrente = st.session_state["utente_loggato"]["username"]
-                ok, res_msg = db.reset_password_admin(username_da_resettare, admin_esecutore=admin_corrente)
-                if ok:
-                    st.success(f"Password temporanea generata per **{username_da_resettare}**:")
-                    st.code(res_msg, language="text")
-                    st.info("Comunica questa stringa all'utente. Al primo accesso dovrà obbligatoriamente cambiarla.")
-                else:
-                    st.error(res_msg)
-
-        st.markdown("---")
-        with st.form("form_nuovo_u", clear_on_submit=True):
-            st.subheader("➕ Crea Nuovo Utente")
-            u_name = st.text_input("Username").strip().lower()
-            u_full = st.text_input("Nome Completo").strip()
-            u_pwd = st.text_input("Password Iniziale", type="password")
-            u_role = st.selectbox("Ruolo", ["Admin", "Magazziniere"])
-
-            if st.form_submit_button("Crea Account", type="primary"):
-                if u_name and u_full and u_pwd:
-                    admin_corrente = st.session_state["utente_loggato"]["username"]
-                    ok, msg = db.crea_utente(u_name, u_pwd, u_full, u_role, admin_esecutore=admin_corrente)
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-                else:
-                    st.warning("Tutti i campi sono obbligatori.")
-
-    with tab_log:
-        st.subheader("📜 Cronologia Immutabile degli Eventi (Audit Trail)")
-        st.caption("Registro ufficiale di tutte le azioni amministrative e di sicurezza eseguite sul sistema.")
-        
-        logs = db.get_log_amministrazione()
-        if logs:
-            df_logs = pd.DataFrame(logs).rename(columns={
-                "id": "ID",
-                "username_admin": "Esecutore",
-                "azione": "Tipo Azione",
-                "dettagli": "Dettagli Operazione",
-                "data_ora": "Data e Ora"
-            })
-            st.dataframe(df_logs, use_container_width=True, hide_index=True)
-        else:
-            st.info("Nessun evento registrato al momento.")
-
-    with tab_b:
-        st.subheader("⏱️ Configurazione Timeout di Inattività")
-        timeout_attuale = st.session_state.get("timeout_minuti", 10)
-        
-        with st.form("form_timeout"):
-            nuovo_timeout = st.number_input(
-                "Minuti di inattività prima del logout automatico:", 
-                min_value=1, 
-                max_value=120, 
-                value=timeout_attuale,
-                help="Tempo di inoperatività trascorso il quale la sessione viene chiusa per sicurezza."
-            )
-            if st.form_submit_button("💾 Salva Impostazione Timeout", type="primary"):
-                st.session_state["timeout_minuti"] = nuovo_timeout
-                st.success(f"Timeout di inattività aggiornato con successo a {nuovo_timeout} minuti.")
-
-        st.markdown("---")
-        st.subheader("📦 Backup Cifrato Manuale")
-        if st.button("🚀 Esegui Backup Cifrato Ora", type="primary"):
-            ok, msg = backup.esegui_backup_cifrato()
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
