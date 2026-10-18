@@ -33,7 +33,7 @@ if not lic_ok:
     st.info("Per sbloccare il sistema, carica o rinnova il file 'license.key' inviato dall'assistenza.")
     st.stop()
 
-# --- GESTIONE SESSIONE E TIMEOUT DI INATTIVITÀ ---
+# --- GESTIONE SESSIONE, TIMEOUT E CONTROLLO ACCESSO SIMULTANEO ---
 if "utente_loggato" not in st.session_state:
     st.session_state["utente_loggato"] = None
 
@@ -41,10 +41,21 @@ if "ultimo_timestamp_attivita" not in st.session_state:
     st.session_state["ultimo_timestamp_attivita"] = time.time()
 
 if "timeout_minuti" not in st.session_state:
-    st.session_state["timeout_minuti"] = 10  # Default a 10 minuti come concordato
+    st.session_state["timeout_minuti"] = 10  # Default a 10 minuti
 
-# Controllo timeout se l'utente è loggato
+# Controllo se l'utente è loggato
 if st.session_state["utente_loggato"] is not None:
+    utente_curr = st.session_state["utente_loggato"]
+    username_curr = utente_curr.get("username")
+    token_curr = utente_curr.get("session_token")
+
+    # 1. CONTROLLO SESSIONE UNICA (Impedisce login multipli con lo stesso account)
+    if not db.verifica_sessione_valida(username_curr, token_curr):
+        st.session_state["utente_loggato"] = None
+        st.error("⚠️ **Sessione interrotta**: Questo account ha effettuato l'accesso da un'altra postazione o browser.")
+        st.stop()
+
+    # 2. CONTROLLO TIMEOUT DI INATTIVITÀ
     tempo_corrente = time.time()
     ultimo_tempo = st.session_state.get("ultimo_timestamp_attivita", tempo_corrente)
     timeout_limite_sec = st.session_state.get("timeout_minuti", 10) * 60
@@ -105,7 +116,6 @@ def render_cambio_password_forzato():
                 else:
                     st.error(msg)
 
-# Definizione della Funzione Admin con la nuova tab per le Zone
 def render_gestione_admin():
     st.title("🛡️ Amministrazione Utenti & Sicurezza")
     

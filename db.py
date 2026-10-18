@@ -143,7 +143,7 @@ def init_db():
                 )
             """)
 
-            # Tabella Utenti con campi di sicurezza avanzati
+            # Tabella Utenti con campi di sicurezza avanzati e session_token
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS utenti (
                     username TEXT PRIMARY KEY,
@@ -152,9 +152,16 @@ def init_db():
                     ruolo TEXT,
                     tentativi_falliti INTEGER DEFAULT 0,
                     account_bloccato INTEGER DEFAULT 0,
-                    cambio_password_richiesto INTEGER DEFAULT 0
+                    cambio_password_richiesto INTEGER DEFAULT 0,
+                    session_token TEXT
                 )
             """)
+
+            # Controllo di sicurezza retrocompatibilità se la tabella esisteva senza session_token
+            try:
+                cursor.execute("ALTER TABLE utenti ADD COLUMN session_token TEXT")
+            except Exception:
+                pass
 
             # Tabella Log Amministrazione (Tracciamento azioni critiche Admin)
             cursor.execute("""
@@ -167,7 +174,7 @@ def init_db():
                 )
             """)
 
-            # --- INDICI SQL PER OTTIMIZZAZIONE PERFORMANCE (Migliaia di SKU) ---
+            # --- INDICI SQL PER OTTIMIZZAZIONE PERFORMANCE ---
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_part_numbers_codice ON part_numbers(pn_codice);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_part_numbers_ubicazione ON part_numbers(ubicazione);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_part_numbers_zona ON part_numbers(zona);")
@@ -218,7 +225,7 @@ def get_tutte_zone():
     return zone
 
 def registra_zona_al_volo(nome_zona: str):
-    """Aggiunge automaticamente una nuova zona se non esiste già (evitando duplicati case-insensitive)."""
+    """Aggiunge automaticamente una nuova zona se non esiste già."""
     if not nome_zona or not nome_zona.strip():
         return "Generale"
     zona_pulita = nome_zona.strip().upper()
@@ -243,16 +250,13 @@ def bonifica_e_unisci_zone(vecchia_zona: str, nuova_zona: str, admin_esecutore: 
         cursor = conn.cursor()
         nuova_pulita = nuova_zona.strip().upper()
         
-        # Assicura che la nuova zona esista
         cursor.execute("INSERT OR IGNORE INTO zone (nome_zona) VALUES (?)", (nuova_pulita,))
         
-        # Aggiorna tutte le tabelle collegate
         cursor.execute("UPDATE part_numbers SET zona = ? WHERE zona = ?", (nuova_pulita, vecchia_zona))
         cursor.execute("UPDATE magazzino_quantita SET zona = ? WHERE zona = ?", (nuova_pulita, vecchia_zona))
         cursor.execute("UPDATE storico_movimenti SET zona = ? WHERE zona = ?", (nuova_pulita, vecchia_zona))
         cursor.execute("UPDATE inventario_dettagli SET zona = ? WHERE zona = ?", (nuova_pulita, vecchia_zona))
         
-        # Rimuove la vecchia zona dalla tabella zone se diversa
         if vecchia_zona != nuova_pulita:
             cursor.execute("DELETE FROM zone WHERE nome_zona = ?", (vecchia_zona,))
             
@@ -317,7 +321,7 @@ def crea_utente(username: str, password_chiara: str, nome_completo: str, ruolo: 
         conn.close()
 
 def autentica_utente(username: str, password_chiara: str):
-    """Autentica l'utente gestendo la politica dei 5 tentativi falliti e il blocco account."""
+    """Autentica l'utente gestendo la politica dei 5 tentativi falliti, il blocco e il token di sessione unico."""
     conn = get_db_connection()
     if not conn:
         return None
@@ -334,12 +338,17 @@ def autentica_utente(username: str, password_chiara: str):
             return {"errore_blocco": True, "messaggio": "Account bloccato per superamento tentativi. Contatta l'Amministratore."}
 
         if verifica_password(password_chiara, user['password_hash']):
-            cursor.execute("UPDATE utenti SET tentativi_falliti = 0 WHERE username = ?", (user_lower,))
+            # Genera un nuovo token di sessione univoco (invalida eventuali sessioni attive altrove)
+            nuovo_token = secrets.token_hex(16)
+            cursor.execute("UPDATE utenti SET tentativi_falliti = 0, session_token = ? WHERE username = ?", (nuovo_token, user_lower))
             conn.commit()
-            return dict(user)
+            
+            user_dict = dict(user)
+            user_dict["session_token"] = nuovo_token
+            return user_dict
         else:
             nuovi_tentativi = user['tentativi_falliti'] + 1
-            if nuevos_tentativi := nuovi_tentativi >= 5:
+            if nuovi_tentativi >= 5:
                 cursor.execute("UPDATE utenti SET tentativi_falliti = ?, account_bloccato = 1 WHERE username = ?", (nuovi_tentativi, user_lower))
                 conn.commit()
                 registra_log_admin("sistema", "BLOCCO_ACCOUNT", f"Account '{user_lower}' bloccato per 5 tentativi falliti.")
@@ -354,6 +363,24 @@ def autentica_utente(username: str, password_chiara: str):
     finally:
         conn.close()
 
+def verifica_sessione_valida(username: str, token_locale: str) -> bool:
+    """Verifica se il token di sessione locale corrisponde a quello attivo sul database (impedisce login multipli)."""
+    if not username or not token_locale:
+        return False
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT session_token FROM utenti WHERE username = ?", (username.strip().lower(),))
+            row = cursor.fetchone()
+            if row and row['session_token'] == token_locale:
+                return True
+        except Exception as e:
+            print(f"Errore verifica sessione: {e}")
+        finally:
+            conn.close()
+    return False
+
 def reset_password_admin(username: str, admin_esecutore: str = "admin"):
     """L'admin resetta la password generando una stringa casuale temporanea."""
     conn = get_db_connection()
@@ -367,7 +394,7 @@ def reset_password_admin(username: str, admin_esecutore: str = "admin"):
 
         cursor.execute("""
             UPDATE utenti 
-            SET password_hash = ?, tentativi_falliti = 0, account_bloccato = 0, cambio_password_richiesto = 1
+            SET password_hash = ?, tentativi_falliti = 0, account_bloccato = 0, cambio_password_richiesto = 1, session_token = NULL
             WHERE username = ?
         """, (hashed, username.strip().lower()))
         conn.commit()
