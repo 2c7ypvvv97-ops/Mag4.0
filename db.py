@@ -32,7 +32,7 @@ def init_db():
                 )
             """)
 
-            # Tabella Part Numbers (Articoli)
+            # Tabella Part Numbers (Articoli con Prezzo Unitario)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS part_numbers (
                     pn_codice TEXT PRIMARY KEY,
@@ -43,9 +43,16 @@ def init_db():
                     scorta_minima INTEGER DEFAULT 5,
                     lotto_riordino INTEGER DEFAULT 10,
                     fornitore_abituale TEXT,
-                    alta_rotazione INTEGER DEFAULT 0
+                    alta_rotazione INTEGER DEFAULT 0,
+                    prezzo_unitario REAL DEFAULT 0.0
                 )
             """)
+
+            # Controllo e migrazione automatica se la colonna prezzo_unitario non esiste in un DB esistente
+            try:
+                cursor.execute("ALTER TABLE part_numbers ADD COLUMN prezzo_unitario REAL DEFAULT 0.0")
+            except Exception:
+                pass
 
             # Tabella Giacenze Magazzino
             cursor.execute("""
@@ -206,7 +213,7 @@ def init_db():
         finally:
             conn.close()
 
-# --- FUNZIONI DI GESTIONE ZONE ---
+# --- FUNZIONI DI GESTIONE ZONE E VALORIZZAZIONE ---
 def get_tutte_zone():
     """Restituisce l'elenco di tutte le zone censite."""
     conn = get_db_connection()
@@ -223,6 +230,31 @@ def get_tutte_zone():
         finally:
             conn.close()
     return zone
+
+def get_valore_totale_per_zona():
+    """Restituisce il riepilogo economico e fisico aggregato per ciascuna zona logistica."""
+    conn = get_db_connection()
+    rows = []
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    p.zona, 
+                    COUNT(p.pn_codice) as totale_codici,
+                    SUM(COALESCE(m.quantita_disponibile, 0)) as totale_pezzi,
+                    SUM(COALESCE(m.quantita_disponibile, 0) * COALESCE(p.prezzo_unitario, 0.0)) as valore_totale
+                FROM part_numbers p
+                LEFT JOIN magazzino_quantita m ON p.pn_codice = m.pn_codice
+                GROUP BY p.zona
+                ORDER BY valore_totale DESC
+            """)
+            rows = [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            print(f"Errore calcolo valore per zona: {e}")
+        finally:
+            conn.close()
+    return rows
 
 def registra_zona_al_volo(nome_zona: str):
     """Aggiunge automaticamente una nuova zona se non esiste già."""
@@ -338,7 +370,6 @@ def autentica_utente(username: str, password_chiara: str):
             return {"errore_blocco": True, "messaggio": "Account bloccato per superamento tentativi. Contatta l'Amministratore."}
 
         if verifica_password(password_chiara, user['password_hash']):
-            # Genera un nuovo token di sessione univoco (invalida eventuali sessioni attive altrove)
             nuovo_token = secrets.token_hex(16)
             cursor.execute("UPDATE utenti SET tentativi_falliti = 0, session_token = ? WHERE username = ?", (nuovo_token, user_lower))
             conn.commit()

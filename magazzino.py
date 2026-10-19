@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-from db import get_db_connection, get_tutte_zone, registra_zona_al_volo
+from db import get_db_connection, get_tutte_zone, registra_zona_al_volo, get_valore_totale_per_zona
 from clienti import get_tutti_clienti
 from etichette_pdf import genera_pdf_etichetta_singola, genera_pdf_lista_riordino
 
@@ -15,27 +15,33 @@ except ImportError:
         return False
 
 def get_ubicazione_articolo(pn_codice: str):
-    """Recupera l'ubicazione e la zona dal database se l'articolo esiste già."""
+    """Recupera l'ubicazione, la zona e il prezzo dal database se l'articolo esiste già."""
     if not pn_codice:
-        return "SCAFFALE-A1", "Generale"
+        return "SCAFFALE-A1", "Generale", 0.0, "Articolo Sconosciuto"
     conn = get_db_connection()
     ubicazione = "SCAFFALE-A1"
     zona = "Generale"
+    prezzo_unitario = 0.0
+    descrizione = f"Articolo {pn_codice}"
     if conn:
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT ubicazione, zona FROM part_numbers WHERE pn_codice = ?", (pn_codice.strip().upper(),))
+            cursor.execute("SELECT descrizione, ubicazione, zona, prezzo_unitario FROM part_numbers WHERE pn_codice = ?", (pn_codice.strip().upper(),))
             row = cursor.fetchone()
             if row:
+                if row['descrizione']:
+                    descrizione = row['descrizione']
                 if row['ubicazione']:
                     ubicazione = row['ubicazione']
                 if row['zona']:
                     zona = row['zona']
+                if row['prezzo_unitario'] is not None:
+                    prezzo_unitario = row['prezzo_unitario']
         except Exception:
             pass
         finally:
             conn.close()
-    return ubicazione, zona
+    return ubicazione, zona, prezzo_unitario, descrizione
 
 def get_stock_completo(filtro_ricerca: str = "", filtro_stato: str = "Tutti", filtro_zona: str = "Tutte"):
     conn = get_db_connection()
@@ -49,7 +55,9 @@ def get_stock_completo(filtro_ricerca: str = "", filtro_stato: str = "Tutti", fi
                     COALESCE(pn.zona, 'Generale') AS zona,
                     pn.scorta_minima, pn.lotto_riordino, pn.fornitore_abituale,
                     COALESCE(pn.alta_rotazione, 0) AS alta_rotazione,
+                    COALESCE(pn.prezzo_unitario, 0.0) AS prezzo_unitario,
                     COALESCE(mq.quantita_disponibile, 0) AS giacenza,
+                    (COALESCE(mq.quantita_disponibile, 0) * COALESCE(pn.prezzo_unitario, 0.0)) AS valore_totale,
                     mq.data_ultimo_aggiornamento
                 FROM part_numbers pn
                 LEFT JOIN magazzino_quantita mq ON pn.pn_codice = mq.pn_codice
@@ -70,8 +78,11 @@ def get_stock_completo(filtro_ricerca: str = "", filtro_stato: str = "Tutti", fi
                 conditions.append("COALESCE(mq.quantita_disponibile, 0) = 0")
 
             if filtro_zona and filtro_zona != "Tutte":
-                conditions.append("COALESCE(pn.zona, 'Generale') = ?")
-                params.append(filtro_zona)
+                if filtro_zona.upper() == "GENERALE":
+                    conditions.append("(UPPER(COALESCE(pn.zona, 'Generale')) = 'GENERALE' OR pn.zona IS NULL OR TRIM(pn.zona) = '')")
+                else:
+                    conditions.append("UPPER(COALESCE(pn.zona, 'Generale')) = ?")
+                    params.append(filtro_zona.upper())
 
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
@@ -96,6 +107,7 @@ def get_articoli_sotto_scorta_con_rotazione():
                     pn.pn_codice, pn.descrizione, pn.ubicazione, COALESCE(pn.zona, 'Generale') AS zona,
                     pn.scorta_minima, pn.fornitore_abituale,
                     COALESCE(pn.alta_rotazione, 0) AS alta_rotazione,
+                    COALESCE(pn.prezzo_unitario, 0.0) AS prezzo_unitario,
                     COALESCE(mq.quantita_disponibile, 0) AS giacenza
                 FROM part_numbers pn
                 LEFT JOIN magazzino_quantita mq ON pn.pn_codice = mq.pn_codice
@@ -146,6 +158,23 @@ def render():
     utente = st.session_state.get("utente_loggato", {})
     nome_operatore = utente.get("nome_completo", utente.get("username", "OPERATORE")).upper()
 
+    # --- SEZIONE RIEPILOGO VALORIZZAZIONE ECONOMICA PER ZONA ---
+    st.subheader("📊 Valorizzazione Economica per Zona")
+    valori_zone = get_valore_totale_per_zona()
+    if valori_zone:
+        cols = st.columns(min(len(valori_zone), 4))
+        for idx, z_info in enumerate(valori_zone):
+            col_target = cols[idx % 4]
+            col_target.metric(
+                label=f"Zona: {z_info['zona']}",
+                value=f"€ {z_info['valore_totale']:,.2f}",
+                delta=f"{z_info['totale_pezzi'] or 0} pz ({z_info['totale_codici']} codici)"
+            )
+    else:
+        st.info("Nessun dato di valorizzazione disponibile.")
+
+    st.markdown("---")
+
     # Recuperiamo preventivamente i dati del sotto scorta per calcolare il badge numerico
     stock_sotto_scorta = get_articoli_sotto_scorta_con_rotazione()
     num_critici = len(stock_sotto_scorta)
@@ -184,10 +213,36 @@ def render():
                     "zona": "Zona",
                     "giacenza": "Giacenza",
                     "scorta_minima": "Scorta Min.",
+                    "prezzo_unitario": "Prezzo Unitario (€)",
+                    "valore_totale": "Valore Totale (€)",
                     "alta_rotazione": "Alta Rotazione",
                     "fornitore_abituale": "Fornitore"
                 })
-                st.dataframe(df_display, use_container_width=True, hide_index=True)
+                
+                # Visualizzazione tabella con formattazione valori economici
+                st.dataframe(
+                    df_display[[
+                        "Part Number", "Descrizione", "Categoria", "Ubicazione", "Zona", 
+                        "Giacenza", "Scorta Min.", "Prezzo Unitario (€)", "Valore Totale (€)", "Fornitore"
+                    ]].style.format({
+                        "Prezzo Unitario (€)": "€ {:.2f}",
+                        "Valore Totale (€)": "€ {:.2f}"
+                    }), 
+                    use_container_width=True, 
+                    hide_index=True
+                )
+
+                # Pulsante di export report CSV / contabile
+                col_exp1, _ = st.columns([1, 3])
+                with col_exp1:
+                    csv_bytes = df_display.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📄 Esporta Report Magazzino (CSV)",
+                        data=csv_bytes,
+                        file_name=f"report_magazzino_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
 
                 st.markdown("#### 🏷️ Stampa Etichetta Selezionata")
                 col_sel, col_btn = st.columns([3, 1])
@@ -219,7 +274,7 @@ def render():
                 pn_in = st.text_input("Part Number (PN) *").strip().upper()
                 qta_in = st.number_input("Quantità *", min_value=1, value=1, step=1)
             with col_b:
-                ubic_sugg, zona_sugg = get_ubicazione_articolo(pn_in) if pn_in else ("SCAFFALE-A1", "Generale")
+                ubic_sugg, zona_sugg, prezzo_sugg, desc_sugg = get_ubicazione_articolo(pn_in) if pn_in else ("SCAFFALE-A1", "Generale", 0.0, "")
                 ubic_in = st.text_input("Ubicazione Magazzino *", value=ubic_sugg).strip().upper()
                 
                 # Gestione Zona con autocompletamento / inserimento dinamico
@@ -243,6 +298,11 @@ def render():
             data_ddt_in = datetime.now()
             note_in = ""
             alta_rot_in = 0
+            prezzo_unitario_in = prezzo_sugg
+            desc_in = desc_sugg
+            cat_in = "Generico"
+            scorta_min_in = 5
+            forn_in = ""
 
             if "SCARICO" in tipo_op:
                 col_s1, col_s2, col_s3 = st.columns(3)
@@ -262,19 +322,21 @@ def render():
             elif "CARICO" in tipo_op:
                 col_c1, col_c2, col_c3 = st.columns(3)
                 with col_c1:
-                    desc_in = st.text_input("Descrizione Articolo (Se nuovo)").strip()
+                    desc_in = st.text_input("Descrizione Articolo", value=desc_sugg).strip()
                     cat_in = st.text_input("Categoria", value="Generico").strip()
                 with col_c2:
                     scorta_min_in = st.number_input("Scorta Minima", min_value=0, value=5)
-                    forn_in = st.text_input("Fornitore Abituale").strip()
+                    prezzo_unitario_in = st.number_input("Prezzo Unitario (€)", min_value=0.0, value=float(prezzo_sugg), step=0.01, format="%.2f")
                 with col_c3:
                     numero_ddt_in = st.text_input("N. DDT Fornitore *").strip()
                     data_ddt_in = st.date_input("Data DDT Fornitore", value=datetime.now())
                 
+                forn_in = st.text_input("Fornitore Abituale").strip()
                 alta_rot_bool = st.checkbox("🔥 Articolo ad Alta Rotazione", value=False)
                 alta_rot_in = 1 if alta_rot_bool else 0
 
             elif "RETTIFICA" in tipo_op:
+                prezzo_unitario_in = st.number_input("Prezzo Unitario (€)", min_value=0.0, value=float(prezzo_sugg), step=0.01, format="%.2f")
                 note_in = st.text_input("Motivo della Rettifica *", placeholder="Es. Conteggio Inventario / Errore precedente").strip()
 
             if st.form_submit_button("🚀 Esegui Operazione", type="primary", use_container_width=True):
@@ -293,32 +355,37 @@ def render():
                         try:
                             cursor = conn.cursor()
                             
-                            # 1. Se CARICO e l'articolo non esiste, crea anagrafica
+                            # 1. Se CARICO e l'articolo non esiste, crea anagrafica (incluso prezzo unitario)
                             if "CARICO" in tipo_op:
                                 cursor.execute("""
-                                    INSERT INTO part_numbers (pn_codice, descrizione, categoria, ubicazione, zona, scorta_minima, fornitore_abituale, alta_rotazione)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                    INSERT INTO part_numbers (pn_codice, descrizione, categoria, ubicazione, zona, scorta_minima, fornitore_abituale, alta_rotazione, prezzo_unitario)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                                     ON CONFLICT(pn_codice) DO UPDATE SET
                                         descrizione=COALESCE(EXCLUDED.descrizione, part_numbers.descrizione),
                                         ubicazione=EXCLUDED.ubicazione,
                                         zona=EXCLUDED.zona,
-                                        alta_rotazione=EXCLUDED.alta_rotazione
-                                """, (pn_in, desc_in if desc_in else f"Articolo {pn_in}", cat_in, ubic_in, zona_finale, scorta_min_in, forn_in, alta_rot_in))
+                                        alta_rotazione=EXCLUDED.alta_rotazione,
+                                        prezzo_unitario=EXCLUDED.prezzo_unitario
+                                """, (pn_in, desc_in if desc_in else f"Articolo {pn_in}", cat_in, ubic_in, zona_finale, scorta_min_in, forn_in, alta_rot_in, prezzo_unitario_in))
+                            elif "RETTIFICA" in tipo_op:
+                                cursor.execute("""
+                                    UPDATE part_numbers SET prezzo_unitario = ?, zona = ?, ubicazione = ? WHERE pn_codice = ?
+                                """, (prezzo_unitario_in, zona_finale, ubic_in, pn_in))
 
-                            # 2. Controllo e aggiornamento giacenza
+                            # 2. Controllo e aggiornamento giacenza (CORRETTO L'ORDINE DEI CONTROLLI)
                             cursor.execute("SELECT quantita_disponibile FROM magazzino_quantita WHERE pn_codice = ?", (pn_in,))
                             row_qta = cursor.fetchone()
                             qta_attuale = row_qta['quantita_disponibile'] if row_qta else 0
 
-                            if "CARICO" in tipo_op:
-                                nuova_qta = qta_attuale + qta_in
-                                tipo_m = "CARICO"
-                            elif "SCARICO" in tipo_op:
+                            if "SCARICO" in tipo_op:
                                 if qta_attuale < qta_in:
                                     st.error(f"Giacenza insufficiente per {pn_in}. Disponibili: {qta_attuale} pz.")
                                     st.stop()
                                 nuova_qta = qta_attuale - qta_in
                                 tipo_m = "SCARICO"
+                            elif "CARICO" in tipo_op:
+                                nuova_qta = qta_attuale + qta_in
+                                tipo_m = "CARICO"
                             else: # RETTIFICA
                                 nuova_qta = qta_in
                                 tipo_m = "RETTIFICA"
@@ -343,7 +410,7 @@ def render():
 
                             conn.commit()
                             st.session_state["ultimo_pn_caricato"] = pn_in
-                            st.session_state["ultima_desc_caricata"] = desc_in if ('desc_in' in locals() and desc_in) else f"Articolo {pn_in}"
+                            st.session_state["ultima_desc_caricata"] = desc_in if desc_in else f"Articolo {pn_in}"
                             st.session_state["ultima_ubic_caricata"] = ubic_in
 
                             st.success(f"Operazione completata! Nuova giacenza per **{pn_in}**: **{nuova_qta} pz** (Zona: {zona_finale}).")
@@ -421,7 +488,7 @@ def render():
                 if not df_alta_rot.empty:
                     st.warning(f"🔥 **ATTENZIONE**: Ci sono {len(df_alta_rot)} articoli ad **Alta Rotazione** sotto scorta!")
                     st.dataframe(
-                        df_alta_rot[["pn_codice", "descrizione", "ubicazione", "zona", "giacenza", "scorta_minima", "fornitore_abituale"]], 
+                        df_alta_rot[["pn_codice", "descrizione", "ubicazione", "zona", "giacenza", "scorta_minima", "prezzo_unitario", "fornitore_abituale"]], 
                         use_container_width=True, 
                         hide_index=True
                     )
@@ -429,7 +496,7 @@ def render():
 
                 st.subheader("📋 Lista Completa Riordino")
                 st.dataframe(
-                    df_ss[["pn_codice", "descrizione", "ubicazione", "zona", "giacenza", "scorta_minima", "alta_rotazione", "fornitore_abituale"]], 
+                    df_ss[["pn_codice", "descrizione", "ubicazione", "zona", "giacenza", "scorta_minima", "prezzo_unitario", "alta_rotazione", "fornitore_abituale"]], 
                     use_container_width=True, 
                     hide_index=True
                 )
