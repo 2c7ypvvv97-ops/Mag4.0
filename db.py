@@ -489,3 +489,171 @@ def get_log_amministrazione():
         finally:
             conn.close()
     return logs
+    
+def get_articoli_in_ubicazione(ubicazione: str):
+    """Restituisce tutti gli articoli presenti in una determinata ubicazione (utile per il trasferimento massivo e per verificare se è occupata)."""
+    conn = get_db_connection()
+    articoli = []
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT m.pn_codice, p.descrizione, m.quantita_disponibile, m.ubicazione, m.zona
+                FROM magazzino_quantita m
+                JOIN part_numbers p ON m.pn_codice = p.pn_codice
+                WHERE UPPER(m.ubicazione) = UPPER(?) AND m.quantita_disponibile > 0
+            """, (ubicazione.strip(),))
+            articoli = [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            print(f"Errore lettura articoli in ubicazione: {e}")
+        finally:
+            conn.close()
+    return articoli
+
+def esegui_trasferimento_singolo(pn_codice: str, nuova_ubicazione: str, nuova_zona: str, quantita: int, operatore: str):
+    """Esegue il trasferimento interno di un singolo articolo verso una nuova ubicazione e zona."""
+    conn = get_db_connection()
+    if not conn:
+        return False, "Errore di connessione al database."
+    try:
+        cursor = conn.cursor()
+        
+        # Recupera dati attuali dell'articolo
+        cursor.execute("SELECT ubicazione, zona, quantita_disponibile FROM magazzino_quantita WHERE pn_codice = ?", (pn_codice,))
+        row = cursor.fetchone()
+        if not row:
+            return False, "Articolo non trovato a magazzino."
+        
+        vecchia_ubicazione = row['ubicazione']
+        vecchia_zona = row['zona']
+        giacenza_attuale = row['quantita_disponibile']
+        
+        if quantita <= 0:
+            return False, "La quantità da trasferire deve essere maggiore di zero."
+        if quantita > giacenza_attuale:
+            return False, f"Quantità insufficiente. Disponibili: {giacenza_attuale} pz."
+
+        # Se sposti tutto il lotto nell'ubicazione attuale, non serve fare nulla di fisico
+        if UPPER_EQ(vecchia_ubicazione, nuova_ubicazione) and UPPER_EQ(vecchia_zona, nuova_zona):
+            return False, "L'ubicazione di destinazione coincide con quella di origine."
+
+        # Normalizza la zona di destinazione (se nuova, la registra)
+        zona_dest_pulita = registra_zona_al_volo(nuova_zona)
+        ubicazione_dest_pulita = nuova_ubicazione.strip().upper()
+
+        if quantita == giacenza_attuale:
+            # Spostamento totale dell'articolo
+            cursor.execute("""
+                UPDATE magazzino_quantita 
+                SET ubicazione = ?, zona = ?, operatore = ?, data_ultimo_aggiornamento = CURRENT_TIMESTAMP
+                WHERE pn_codice = ?
+            """, (ubicazione_dest_pulita, zona_dest_pulita, operatore, pn_codice))
+            
+            cursor.execute("""
+                UPDATE part_numbers 
+                SET ubicazione = ?, zona = ?
+                WHERE pn_codice = ?
+            """, (ubicazione_dest_pulita, zona_dest_pulita, pn_codice))
+        else:
+            # Spostamento parziale: riduce la giacenza nella vecchia ubicazione
+            # Nota: se l'architettura gestisce più righe per ubicazione, qui adeguiamo in base alla tabella magazzino_quantita
+            nuova_giacenza_origine = giacenza_attuale - quantita
+            cursor.execute("""
+                UPDATE magazzino_quantita 
+                SET quantita_disponibile = ?, operatore = ?, data_ultimo_aggiornamento = CURRENT_TIMESTAMP
+                WHERE pn_codice = ?
+            """, (nuova_giacenza_origine, operatore, pn_codice))
+            
+            # Verifica se esiste già una riga per questo articolo nella nuova ubicazione o inserisce/aggiorna
+            # (Per semplicità nella struttura attuale dove pn_codice è PRIMARY KEY in magazzino_quantita, gestiamo il saldo o inseriamo la nuova locazione)
+            # Se la tabella ha pn_codice come PK, creiamo/aggiorniamo la locazione principale o gestiamo lo stock
+            cursor.execute("""
+                INSERT INTO magazzino_quantita (pn_codice, quantita_disponibile, ubicazione, zona, operatore, data_ultimo_aggiornamento)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(pn_codice) DO UPDATE SET 
+                quantita_disponibile = quantita_disponibile + ?,
+                ubicazione = ?, zona = ?, operatore = ?
+            """, (pn_codice, quantita, ubicazione_dest_pulita, zona_dest_pulita, operatore, quantita, ubicazione_dest_pulita, zona_dest_pulita, operatore))
+
+            cursor.execute("""
+                UPDATE part_numbers 
+                SET ubicazione = ?, zona = ?
+                WHERE pn_codice = ?
+            """, (ubicazione_dest_pulita, zona_dest_pulita, pn_codice))
+
+        # Registrazione nel Registro Movimenti (Audit Trail Immutabile)
+        causale_testo = f"Trasferimento interno da {vecchia_ubicazione} ({vecchia_zona}) a {ubicazione_dest_pulita} ({zona_dest_pulita})"
+        cursor.execute("""
+            INSERT INTO storico_movimenti (pn_codice, tipo_movimento, quantita, causale, ubicazione, zona, operatore, note)
+            VALUES (?, 'TRASFERIMENTO', ?, ?, ?, ?, ?, ?)
+        """, (pn_codice, quantita, causale_testo, ubicazione_dest_pulita, zona_dest_pulita, operatore, f"Da {vecchia_ubicazione} a {ubicazione_dest_pulita}"))
+
+        conn.commit()
+        return True, f"Trasferimento di {quantita} pz dell'articolo {pn_codice} completato con successo."
+    except Exception as e:
+        conn.rollback()
+        return False, f"Errore durante il trasferimento: {e}"
+    finally:
+        conn.close()
+
+def esegui_trasferimento_massivo(ubicazione_origine: str, nuova_ubicazione: str, nuova_zona: str, operatore: str):
+    """Esegue il trasferimento massivo di tutti gli articoli presenti in un'ubicazione di origine verso una nuova ubicazione (es. bancale misto)."""
+    conn = get_db_connection()
+    if not conn:
+        return False, "Errore di connessione al database."
+    try:
+        cursor = conn.cursor()
+        
+        articoli = get_articoli_in_ubicazione(ubicazione_origine)
+        if not articoli:
+            return False, f"Nessun articolo trovato nell'ubicazione di origine '{ubicazione_origine}'."
+
+        zona_dest_pulita = registra_zona_al_volo(nuova_zona)
+        ubicazione_dest_pulita = nuova_ubicazione.strip().upper()
+        
+        if UPPER_EQ(ubicazione_origine, ubicazione_dest_pulita):
+            return False, "L'ubicazione di destinazione non può coincidere con quella di origine."
+
+        articoli_spostati = 0
+        pezzi_totali = 0
+
+        for art in articoli:
+            pn = art['pn_codice']
+            qta = art['quantita_disponibile']
+            
+            # Aggiorna giacenze e ubicazione
+            cursor.execute("""
+                UPDATE magazzino_quantita 
+                SET ubicazione = ?, zona = ?, operatore = ?, data_ultimo_aggiornamento = CURRENT_TIMESTAMP
+                WHERE pn_codice = ?
+            """, (ubicazione_dest_pulita, zona_dest_pulita, operatore, pn))
+            
+            cursor.execute("""
+                UPDATE part_numbers 
+                SET ubicazione = ?, zona = ?
+                WHERE pn_codice = ?
+            """, (ubicazione_dest_pulita, zona_dest_pulita, pn))
+
+            # Scrive nel registro storico movimenti
+            causale_testo = f"Trasferimento massivo bancale da {ubicazione_origine} a {ubicazione_dest_pulita}"
+            cursor.execute("""
+                INSERT INTO storico_movimenti (pn_codice, tipo_movimento, quantita, causale, ubicazione, zona, operatore, note)
+                VALUES (?, 'TRASFERIMENTO_MASSIVO', ?, ?, ?, ?, ?, ?)
+            """, (pn, qta, causale_testo, ubicazione_dest_pulita, zona_dest_pulita, operatore, f"Spostamento blocco da {ubicazione_origine}"))
+
+            articoli_spostati += 1
+            pezzi_totali += qta
+
+        conn.commit()
+        return True, f"Trasferimento massivo completato: spostati {articoli_spostati} articoli ({pezzi_totali} pezzi totali) da '{ubicazione_origine}' a '{ubicazione_dest_pulita}'."
+    except Exception as e:
+        conn.rollback()
+        return False, f"Errore durante il trasferimento massivo: {e}"
+    finally:
+        conn.close()
+
+def UPPER_EQ(s1, s2):
+    """Funzione di supporto per confronto stringhe case-insensitive sicuro."""
+    if not s1 or not s2:
+        return False
+    return str(s1).strip().upper() == str(s2).strip().upper()

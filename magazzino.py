@@ -1,7 +1,15 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-from db import get_db_connection, get_tutte_zone, registra_zona_al_volo, get_valore_totale_per_zona
+from db import (
+    get_db_connection, 
+    get_tutte_zone, 
+    registra_zona_al_volo, 
+    get_valore_totale_per_zona,
+    get_articoli_in_ubicazione,
+    esegui_trasferimento_singolo,
+    esegui_trasferimento_massivo
+)
 from clienti import get_tutti_clienti
 from etichette_pdf import genera_pdf_etichetta_singola, genera_pdf_lista_riordino
 
@@ -182,7 +190,7 @@ def render():
 
     tab_stock, tab_movimenti, tab_sotto_scorta, tab_storico = st.tabs([
         "📋 Stock Live & Giacenze", 
-        "🔄 Movimentazione (Carico/Scarico/Rettifica)", 
+        "🔄 Movimentazione (Carico/Scarico/Rettifica/Trasferimento)", 
         f"🚨 Sotto Scorta & Riordini{badge_text}",
         "📜 Registro Movimenti"
     ])
@@ -264,205 +272,348 @@ def render():
             else:
                 st.info("Nessun articolo trovato con i criteri di ricerca inseriti.")
 
-    # --- TAB 2: CARICO / SCARICO / RETTIFICA ---
+    # --- TAB 2: CARICO / SCARICO / RETTIFICA / TRASFERIMENTO ---
     with tab_movimenti:
-        tipo_op = st.radio("Seleziona Tipo Operazione:", ["📥 CARICO (Ingresso)", "📤 SCARICO (Uscita)", "✏️ RETTIFICA INVENTARIO"], horizontal=True)
+        tipo_op = st.radio(
+            "Seleziona Tipo Operazione:", 
+            ["📥 CARICO (Ingresso)", "📤 SCARICO (Uscita)", "✏️ RETTIFICA INVENTARIO", "↔️ TRASFERIMENTO INTERNO"], 
+            horizontal=True
+        )
         
-        with st.form("form_movimentazione", clear_on_submit=True):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                pn_in = st.text_input("Part Number (PN) *").strip().upper()
-                qta_in = st.number_input("Quantità *", min_value=1, value=1, step=1)
-            with col_b:
-                ubic_sugg, zona_sugg, prezzo_sugg, desc_sugg = get_ubicazione_articolo(pn_in) if pn_in else ("SCAFFALE-A1", "Generale", 0.0, "")
-                ubic_in = st.text_input("Ubicazione Magazzino *", value=ubic_sugg).strip().upper()
-                
-                # Gestione Zona con autocompletamento / inserimento dinamico
-                zone_esistenti = get_tutte_zone()
-                zona_input_scelta = st.selectbox(
-                    "Zona Logistica", 
-                    options=zone_esistenti + ["➕ Nuova Zona..."],
-                    index=zone_esistenti.index(zona_sugg) if zona_sugg in zone_esistenti else 0
-                )
-                
-                if zona_input_scelta == "➕ Nuova Zona...":
-                    zona_in = st.text_input("Digita Nome Nuova Zona:").strip().upper()
-                else:
-                    zona_in = zona_input_scelta
-
-                st.text_input("Operatore", value=nome_operatore, disabled=True)
-
-            causale_in = ""
-            cliente_in = None
-            numero_ddt_in = ""
-            data_ddt_in = datetime.now()
-            note_in = ""
-            alta_rot_in = 0
-            prezzo_unitario_in = prezzo_sugg
-            desc_in = desc_sugg
-            cat_in = "Generico"
-            scorta_min_in = 5
-            forn_in = ""
-
-            if "SCARICO" in tipo_op:
-                col_s1, col_s2, col_s3 = st.columns(3)
-                with col_s1:
-                    causale_in = st.selectbox("Causale Uscita:", ["Vendita Cliente", "Consumo Interno", "Scarto/Danneggiato", "Manutenzione"])
-                with col_s2:
-                    clienti_lista = get_tutti_clienti()
-                    opzioni_cli = {"Nessuno / Interno": None}
-                    for c in clienti_lista:
-                        opzioni_cli[f"{c['codice_cliente']} - {c['ragione_sociale']}"] = c['codice_cliente']
-                    cli_scelto_lbl = st.selectbox("Cliente Destinatario:", list(opzioni_cli.keys()))
-                    cliente_in = opzioni_cli[cli_scelto_lbl]
-                with col_s3:
-                    numero_ddt_in = st.text_input("N. DDT Uscita *").strip()
-                    data_ddt_in = st.date_input("Data DDT Uscita", value=datetime.now())
-
-            elif "CARICO" in tipo_op:
-                col_c1, col_c2, col_c3 = st.columns(3)
-                with col_c1:
-                    desc_in = st.text_input("Descrizione Articolo", value=desc_sugg).strip()
-                    cat_in = st.text_input("Categoria", value="Generico").strip()
-                with col_c2:
-                    scorta_min_in = st.number_input("Scorta Minima", min_value=0, value=5)
-                    prezzo_unitario_in = st.number_input("Prezzo Unitario (€)", min_value=0.0, value=float(prezzo_sugg), step=0.01, format="%.2f")
-                with col_c3:
-                    numero_ddt_in = st.text_input("N. DDT Fornitore *").strip()
-                    data_ddt_in = st.date_input("Data DDT Fornitore", value=datetime.now())
-                
-                forn_in = st.text_input("Fornitore Abituale").strip()
-                alta_rot_bool = st.checkbox("🔥 Articolo ad Alta Rotazione", value=False)
-                alta_rot_in = 1 if alta_rot_bool else 0
-
-            elif "RETTIFICA" in tipo_op:
-                prezzo_unitario_in = st.number_input("Prezzo Unitario (€)", min_value=0.0, value=float(prezzo_sugg), step=0.01, format="%.2f")
-                note_in = st.text_input("Motivo della Rettifica *", placeholder="Es. Conteggio Inventario / Errore precedente").strip()
-
-            if st.form_submit_button("🚀 Esegui Operazione", type="primary", use_container_width=True):
-                if not pn_in or not ubic_in:
-                    st.error("I campi Part Number e Ubicazione sono obbligatori.")
-                elif ("CARICO" in tipo_op or "SCARICO" in tipo_op) and not numero_ddt_in:
-                    st.error("Il Numero di DDT è obbligatorio per i Carichi e gli Scarichi.")
-                elif "RETTIFICA" in tipo_op and not note_in:
-                    st.error("Inserisci la motivazione per la rettifica.")
-                else:
-                    # Registra la zona al volo se nuova
-                    zona_finale = registra_zona_al_volo(zona_in if zona_in else "Generale")
-
-                    conn = get_db_connection()
-                    if conn:
-                        try:
-                            cursor = conn.cursor()
-                            
-                            # 1. Se CARICO e l'articolo non esiste, crea anagrafica (incluso prezzo unitario)
-                            if "CARICO" in tipo_op:
-                                cursor.execute("""
-                                    INSERT INTO part_numbers (pn_codice, descrizione, categoria, ubicazione, zona, scorta_minima, fornitore_abituale, alta_rotazione, prezzo_unitario)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    ON CONFLICT(pn_codice) DO UPDATE SET
-                                        descrizione=COALESCE(EXCLUDED.descrizione, part_numbers.descrizione),
-                                        ubicazione=EXCLUDED.ubicazione,
-                                        zona=EXCLUDED.zona,
-                                        alta_rotazione=EXCLUDED.alta_rotazione,
-                                        prezzo_unitario=EXCLUDED.prezzo_unitario
-                                """, (pn_in, desc_in if desc_in else f"Articolo {pn_in}", cat_in, ubic_in, zona_finale, scorta_min_in, forn_in, alta_rot_in, prezzo_unitario_in))
-                            elif "RETTIFICA" in tipo_op:
-                                cursor.execute("""
-                                    UPDATE part_numbers SET prezzo_unitario = ?, zona = ?, ubicazione = ? WHERE pn_codice = ?
-                                """, (prezzo_unitario_in, zona_finale, ubic_in, pn_in))
-
-                            # 2. Controllo e aggiornamento giacenza (CORRETTO L'ORDINE DEI CONTROLLI)
-                            cursor.execute("SELECT quantita_disponibile FROM magazzino_quantita WHERE pn_codice = ?", (pn_in,))
-                            row_qta = cursor.fetchone()
-                            qta_attuale = row_qta['quantita_disponibile'] if row_qta else 0
-
-                            if "SCARICO" in tipo_op:
-                                if qta_attuale < qta_in:
-                                    st.error(f"Giacenza insufficiente per {pn_in}. Disponibili: {qta_attuale} pz.")
-                                    st.stop()
-                                nuova_qta = qta_attuale - qta_in
-                                tipo_m = "SCARICO"
-                            elif "CARICO" in tipo_op:
-                                nuova_qta = qta_attuale + qta_in
-                                tipo_m = "CARICO"
-                            else: # RETTIFICA
-                                nuova_qta = qta_in
-                                tipo_m = "RETTIFICA"
-
-                            cursor.execute("""
-                                INSERT INTO magazzino_quantita (pn_codice, quantita_disponibile, ubicazione, zona, operatore, data_ultimo_aggiornamento)
-                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                                ON CONFLICT(pn_codice) DO UPDATE SET
-                                    quantita_disponibile = EXCLUDED.quantita_disponibile,
-                                    ubicazione = EXCLUDED.ubicazione,
-                                    zona = EXCLUDED.zona,
-                                    operatore = EXCLUDED.operatore,
-                                    data_ultimo_aggiornamento = CURRENT_TIMESTAMP
-                            """, (pn_in, nuova_qta, ubic_in, zona_finale, nome_operatore))
-
-                            # 3. Registrazione Audit Log con DDT e Zona
-                            str_data_ddt = data_ddt_in.strftime('%Y-%m-%d') if data_ddt_in else None
-                            cursor.execute("""
-                                INSERT INTO storico_movimenti (pn_codice, tipo_movimento, quantita, causale, codice_cliente, numero_ddt, data_ddt, ubicazione, zona, operatore, note)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (pn_in, tipo_m, qta_in, causale_in, cliente_in, numero_ddt_in if numero_ddt_in else None, str_data_ddt, ubic_in, zona_finale, nome_operatore, note_in))
-
-                            conn.commit()
-                            st.session_state["ultimo_pn_caricato"] = pn_in
-                            st.session_state["ultima_desc_caricata"] = desc_in if desc_in else f"Articolo {pn_in}"
-                            st.session_state["ultima_ubic_caricata"] = ubic_in
-
-                            st.success(f"Operazione completata! Nuova giacenza per **{pn_in}**: **{nuova_qta} pz** (Zona: {zona_finale}).")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Errore operazione: {e}")
-                        finally:
-                            conn.close()
-
-        # Blocco opzioni di stampa per l'ultimo articolo registrato
-        if "ultimo_pn_caricato" in st.session_state:
-            st.markdown("---")
-            st.info(f"✨ Ultimo articolo registrato/caricato: **{st.session_state['ultimo_pn_caricato']}**. Scegli la modalità di stampa:")
-            
-            modalita_stampa = st.radio(
-                "Modalità di stampa etichetta:", 
-                ["📥 Scarica PDF Standard", "🏷️ Stampa Diretta su Stampante Termica (Zebra IP)"],
-                horizontal=True,
-                key="radio_modalita_stampa"
+        if "TRASFERIMENTO" in tipo_op:
+            st.markdown("### 🔄 Gestione Trasferimenti Interni e Cambio Ubicazione")
+            modo_trasferimento = st.radio(
+                "Seleziona Modalità Trasferimento:", 
+                ["Articolo Singolo", "Massivo per Ubicazione (Bancale)"], 
+                horizontal=True
             )
             
-            if "PDF" in modalita_stampa:
-                pdf_bytes_nuovo = genera_pdf_etichetta_singola(
-                    st.session_state["ultimo_pn_caricato"], 
-                    st.session_state["ultima_desc_caricata"], 
-                    st.session_state["ultima_ubic_caricata"]
+            if modo_trasferimento == "Articolo Singolo":
+                col_t1, col_t2 = st.columns(2)
+                with col_t1:
+                    pn_trasf = st.text_input("Part Number da Spostare *", key="pn_trasferimento_singolo").strip().upper()
+                with col_t2:
+                    ubic_att, zona_att, prezzo_att, desc_att = get_ubicazione_articolo(pn_trasf) if pn_trasf else ("", "", 0.0, "")
+                    
+                    # Recupera giacenza disponibile esatta
+                    giacenza_disponibile = 0
+                    if pn_trasf:
+                        conn_q = get_db_connection()
+                        if conn_q:
+                            try:
+                                cur_q = conn_q.cursor()
+                                cur_q.execute("SELECT quantita_disponibile FROM magazzino_quantita WHERE pn_codice = ?", (pn_trasf,))
+                                row_g = cur_q.fetchone()
+                                if row_g:
+                                    giacenza_disponibile = row_g['quantita_disponibile']
+                            except Exception:
+                                pass
+                            finally:
+                                conn_q.close()
+                    
+                    st.info(f"📍 Posizione attuale: **{ubic_att}** (Zona: {zona_att}) | Giacenza: **{giacenza_disponibile} pz**")
+                    
+                col_t3, col_t4 = st.columns(2)
+                with col_t3:
+                    nuova_ubic_singola = st.text_input("Nuova Ubicazione di Destinazione *", key="nuova_ubic_singola").strip().upper()
+                with col_t4:
+                    zone_esistenti = get_tutte_zone()
+                    zona_dest_scelta = st.selectbox(
+                        "Nuova Zona Logistica", 
+                        options=zone_esistenti + ["➕ Nuova Zona..."],
+                        key="zona_dest_singola_sel"
+                    )
+                    if zona_dest_scelta == "➕ Nuova Zona...":
+                        nuova_zona_singola = st.text_input("Digita Nome Nuova Zona:", key="nuova_zona_singola_testo").strip().upper()
+                    else:
+                        nuova_zona_singola = zona_dest_scelta
+
+                # Quantità precompilata di default sulla giacenza attuale
+                qta_da_spostare = st.number_input(
+                    "Quantità da Trasferire *", 
+                    min_value=1, 
+                    value=int(giacenza_disponibile) if giacenza_disponibile > 0 else 1, 
+                    step=1, 
+                    key="qta_trasferimento_singolo"
                 )
-                st.download_button(
-                    label=f"🖨️ Scarica Etichetta PDF per {st.session_state['ultimo_pn_caricato']}",
-                    data=pdf_bytes_nuovo,
-                    file_name=f"Etichetta_{st.session_state['ultimo_pn_caricato']}.pdf",
-                    mime="application/pdf",
-                    type="primary"
-                )
-            else:
-                ip_attuale_global = st.session_state.get("ip_stampante_zebra_globale", "192.168.1.50")
-                col_ip, col_btn_zpl = st.columns([2, 1])
-                with col_ip:
-                    ip_zebra = st.text_input("Indirizzo IP Stampante Zebra:", value=ip_attuale_global, key="ip_zebra_input")
-                with col_btn_zpl:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    if st.button("🚀 Invia a Stampante", type="primary"):
-                        zpl_string = genera_zpl_etichetta(
-                            st.session_state["ultimo_pn_caricato"], 
-                            st.session_state["ultima_desc_caricata"], 
-                            st.session_state["ultima_ubic_caricata"]
-                        )
-                        successo = invia_a_stampante_zebra(ip_zebra, zpl_string)
+
+                # Controllo visivo se l'ubicazione di destinazione è già occupata
+                if nuova_ubic_singola:
+                    articoli_occupanti = get_articoli_in_ubicazione(nuova_ubic_singola)
+                    if articoli_occupanti:
+                        st.warning(f"⚠️ **Attenzione**: L'ubicazione **{nuova_ubic_singola}** risulta già occupata da altri articoli (es. {articoli_occupanti[0]['pn_codice']} - {articoli_occupanti[0]['descrizione']}).")
+
+                if st.button("🚀 Conferma Trasferimento Singolo", type="primary", use_container_width=True):
+                    if not pn_trasf or not nuova_ubic_singola:
+                        st.error("Compila tutti i campi obbligatori (Part Number e Nuova Ubicazione).")
+                    else:
+                        successo, messaggio = esegui_trasferimento_singolo(pn_trasf, nuova_ubic_singola, nuova_zona_singola, qta_da_spostare, nome_operatore)
                         if successo:
-                            st.success("Etichetta inviata con successo alla stampante termica!")
+                            st.success(messaggio)
+                            st.rerun()
                         else:
-                            st.error("Impossibile connettersi alla stampante. Verifica l'indirizzo IP.")
+                            st.error(messaggio)
+
+            else:  # Massivo per Ubicazione (Bancale)
+                st.markdown("#### Spostamento Massivo Bancale / Blocco Misto")
+                
+                # Ricerca rapida tra le ubicazioni attualmente popolate
+                conn_ub = get_db_connection()
+                ubicazioni_popolate = []
+                if conn_ub:
+                    try:
+                        cur_ub = conn_ub.cursor()
+                        cur_ub.execute("SELECT DISTINCT ubicazione FROM magazzino_quantita WHERE quantita_disponibile > 0 ORDER BY ubicazione ASC")
+                        ubicazioni_popolate = [r['ubicazione'] for r in cur_ub.fetchall()]
+                    except Exception:
+                        pass
+                    finally:
+                        conn_ub.close()
+
+                col_m1, col_m2 = st.columns(2)
+                with col_m1:
+                    if ubicazioni_popolate:
+                        ubicazione_origine = st.selectbox("Seleziona Ubicazione di Partenza (Bancale):", options=ubicazioni_popolate, key="sel_ubic_origine_massiva")
+                    else:
+                        ubicazione_origine = st.text_input("Ubicazione di Partenza *", key="txt_ubic_origine_massiva").strip().upper()
+                    
+                    # Mostra subito l'anteprima degli articoli presenti nell'ubicazione selezionata
+                    if ubicazione_origine:
+                        articoli_blocco = get_articoli_in_ubicazione(ubicazione_origine)
+                        if articoli_blocco:
+                            st.info(f"📦 Trovati **{len(articoli_blocco)} articoli** in `{ubicazione_origine}` (Totale pezzi: {sum(a['quantita_disponibile'] for a in articoli_blocco)})")
+                            df_anteprima = pd.DataFrame(articoli_blocco)
+                            st.dataframe(df_anteprima[["pn_codice", "descrizione", "quantita_disponibile", "zona"]], use_container_width=True, hide_index=True)
+                        else:
+                            st.warning("Nessun articolo trovato in questa ubicazione.")
+
+                with col_m2:
+                    nuova_ubicazione_massiva = st.text_input("Nuova Ubicazione di Destinazione (Bancale) *", key="txt_ubic_dest_massiva").strip().upper()
+                    
+                    zone_esistenti = get_tutte_zone()
+                    zona_dest_m_scelta = st.selectbox(
+                        "Nuova Zona Logistica di Destinazione", 
+                        options=zone_esistenti + ["➕ Nuova Zona..."],
+                        key="zona_dest_massiva_sel"
+                    )
+                    if zona_dest_m_scelta == "➕ Nuova Zona...":
+                        nuova_zona_massiva = st.text_input("Digita Nome Nuova Zona:", key="nuova_zona_massiva_testo").strip().upper()
+                    else:
+                        nuova_zona_massiva = zona_dest_m_scelta
+
+                    # Controllo occupazione destinazione in tempo reale via codice
+                    if nuova_ubicazione_massiva:
+                        articoli_dest_occupata = get_articoli_in_ubicazione(nuova_ubicazione_massiva)
+                        if articoli_dest_occupata:
+                            st.warning(f"⚠️ **Attenzione**: L'ubicazione di destinazione **{nuova_ubicazione_massiva}** è già occupata da altri materiali!")
+
+                st.markdown("---")
+                
+                # Pulsante di esecuzione sempre visibile (se i campi obbligatori sono compilati)
+                if st.button("🚀 Conferma Trasferimento Massivo in Blocco", type="primary", use_container_width=True):
+                    if not ubicazione_origine or not nuova_ubicazione_massiva:
+                        st.error("Inserisci sia l'ubicazione di partenza che quella di destinazione.")
+                    else:
+                        successo_m, messaggio_m = esegui_trasferimento_massivo(ubicazione_origine, nuova_ubicazione_massiva, nuova_zona_massiva, nome_operatore)
+                        if successo_m:
+                            st.success(messaggio_m)
+                            st.rerun()
+                        else:
+                            st.error(messaggio_m)
+
+        else:
+            # Codice per CARICO / SCARICO / RETTIFICA
+            with st.form("form_movimentazione", clear_on_submit=True):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    pn_in = st.text_input("Part Number (PN) *").strip().upper()
+                    qta_in = st.number_input("Quantità *", min_value=1, value=1, step=1)
+                with col_b:
+                    ubic_sugg, zona_sugg, prezzo_sugg, desc_sugg = get_ubicazione_articolo(pn_in) if pn_in else ("SCAFFALE-A1", "Generale", 0.0, "")
+                    ubic_in = st.text_input("Ubicazione Magazzino *", value=ubic_sugg).strip().upper()
+                    
+                    # Gestione Zona con autocompletamento / inserimento dinamico
+                    zone_esistenti = get_tutte_zone()
+                    zona_input_scelta = st.selectbox(
+                        "Zona Logistica", 
+                        options=zone_esistenti + ["➕ Nuova Zona..."],
+                        index=zone_esistenti.index(zona_sugg) if zona_sugg in zone_esistenti else 0
+                    )
+                    
+                    if zona_input_scelta == "➕ Nuova Zona...":
+                        zona_in = st.text_input("Digita Nome Nuova Zona:").strip().upper()
+                    else:
+                        zona_in = zona_input_scelta
+
+                    st.text_input("Operatore", value=nome_operatore, disabled=True)
+
+                causale_in = ""
+                cliente_in = None
+                numero_ddt_in = ""
+                data_ddt_in = datetime.now()
+                note_in = ""
+                alta_rot_in = 0
+                prezzo_unitario_in = prezzo_sugg
+                desc_in = desc_sugg
+                cat_in = "Generico"
+                scorta_min_in = 5
+                forn_in = ""
+
+                if "SCARICO" in tipo_op:
+                    col_s1, col_s2, col_s3 = st.columns(3)
+                    with col_s1:
+                        causale_in = st.selectbox("Causale Uscita:", ["Vendita Cliente", "Consumo Interno", "Scarto/Danneggiato", "Manutenzione"])
+                    with col_s2:
+                        clienti_lista = get_tutti_clienti()
+                        opzioni_cli = {"Nessuno / Interno": None}
+                        for c in clienti_lista:
+                            opzioni_cli[f"{c['codice_cliente']} - {c['ragione_sociale']}"] = c['codice_cliente']
+                        cli_scelto_lbl = st.selectbox("Cliente Destinatario:", list(opzioni_cli.keys()))
+                        cliente_in = opzioni_cli[cli_scelto_lbl]
+                    with col_s3:
+                        numero_ddt_in = st.text_input("N. DDT Uscita *").strip()
+                        data_ddt_in = st.date_input("Data DDT Uscita", value=datetime.now())
+
+                elif "CARICO" in tipo_op:
+                    col_c1, col_c2, col_c3 = st.columns(3)
+                    with col_c1:
+                        desc_in = st.text_input("Descrizione Articolo", value=desc_sugg).strip()
+                        cat_in = st.text_input("Categoria", value="Generico").strip()
+                    with col_c2:
+                        scorta_min_in = st.number_input("Scorta Minima", min_value=0, value=5)
+                        prezzo_unitario_in = st.number_input("Prezzo Unitario (€)", min_value=0.0, value=float(prezzo_sugg), step=0.01, format="%.2f")
+                    with col_c3:
+                        numero_ddt_in = st.text_input("N. DDT Fornitore *").strip()
+                        data_ddt_in = st.date_input("Data DDT Fornitore", value=datetime.now())
+                    
+                    forn_in = st.text_input("Fornitore Abituale").strip()
+                    alta_rot_bool = st.checkbox("🔥 Articolo ad Alta Rotazione", value=False)
+                    alta_rot_in = 1 if alta_rot_bool else 0
+
+                elif "RETTIFICA" in tipo_op:
+                    prezzo_unitario_in = st.number_input("Prezzo Unitario (€)", min_value=0.0, value=float(prezzo_sugg), step=0.01, format="%.2f")
+                    note_in = st.text_input("Motivo della Rettifica *", placeholder="Es. Conteggio Inventario / Errore precedente").strip()
+
+                if st.form_submit_button("🚀 Esegui Operazione", type="primary", use_container_width=True):
+                    if not pn_in or not ubic_in:
+                        st.error("I campi Part Number e Ubicazione sono obbligatori.")
+                    elif ("CARICO" in tipo_op or "SCARICO" in tipo_op) and not numero_ddt_in:
+                        st.error("Il Numero di DDT è obbligatorio per i Carichi e gli Scarichi.")
+                    elif "RETTIFICA" in tipo_op and not note_in:
+                        st.error("Inserisci la motivazione per la rettifica.")
+                    else:
+                        zona_finale = registra_zona_al_volo(zona_in if zona_in else "Generale")
+
+                        conn = get_db_connection()
+                        if conn:
+                            try:
+                                cursor = conn.cursor()
+                                
+                                if "CARICO" in tipo_op:
+                                    cursor.execute("""
+                                        INSERT INTO part_numbers (pn_codice, descrizione, categoria, ubicazione, zona, scorta_minima, fornitore_abituale, alta_rotazione, prezzo_unitario)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        ON CONFLICT(pn_codice) DO UPDATE SET
+                                            descrizione=COALESCE(EXCLUDED.descrizione, part_numbers.descrizione),
+                                            ubicazione=EXCLUDED.ubicazione,
+                                            zona=EXCLUDED.zona,
+                                            alta_rotazione=EXCLUDED.alta_rotazione,
+                                            prezzo_unitario=EXCLUDED.prezzo_unitario
+                                    """, (pn_in, desc_in if desc_in else f"Articolo {pn_in}", cat_in, ubic_in, zona_finale, scorta_min_in, forn_in, alta_rot_in, prezzo_unitario_in))
+                                elif "RETTIFICA" in tipo_op:
+                                    cursor.execute("""
+                                        UPDATE part_numbers SET prezzo_unitario = ?, zona = ?, ubicazione = ? WHERE pn_codice = ?
+                                    """, (prezzo_unitario_in, zona_finale, ubic_in, pn_in))
+
+                                cursor.execute("SELECT quantita_disponibile FROM magazzino_quantita WHERE pn_codice = ?", (pn_in,))
+                                row_qta = cursor.fetchone()
+                                qta_attuale = row_qta['quantita_disponibile'] if row_qta else 0
+
+                                if "SCARICO" in tipo_op:
+                                    if qta_attuale < qta_in:
+                                        st.error(f"Giacenza insufficiente per {pn_in}. Disponibili: {qta_attuale} pz.")
+                                        st.stop()
+                                    nuova_qta = qta_attuale - qta_in
+                                    tipo_m = "SCARICO"
+                                elif "CARICO" in tipo_op:
+                                    nuova_qta = qta_attuale + qta_in
+                                    tipo_m = "CARICO"
+                                else:
+                                    nuova_qta = qta_in
+                                    tipo_m = "RETTIFICA"
+
+                                cursor.execute("""
+                                    INSERT INTO magazzino_quantita (pn_codice, quantita_disponibile, ubicazione, zona, operatore, data_ultimo_aggiornamento)
+                                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                    ON CONFLICT(pn_codice) DO UPDATE SET
+                                        quantita_disponibile = EXCLUDED.quantita_disponibile,
+                                        ubicazione = EXCLUDED.ubicazione,
+                                        zona = EXCLUDED.zona,
+                                        operatore = EXCLUDED.operatore,
+                                        data_ultimo_aggiornamento = CURRENT_TIMESTAMP
+                                """, (pn_in, nuova_qta, ubic_in, zona_finale, nome_operatore))
+
+                                str_data_ddt = data_ddt_in.strftime('%Y-%m-%d') if data_ddt_in else None
+                                cursor.execute("""
+                                    INSERT INTO storico_movimenti (pn_codice, tipo_movimento, quantita, causale, codice_cliente, numero_ddt, data_ddt, ubicazione, zona, operatore, note)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (pn_in, tipo_m, qta_in, causale_in, cliente_in, numero_ddt_in if numero_ddt_in else None, str_data_ddt, ubic_in, zona_finale, nome_operatore, note_in))
+
+                                conn.commit()
+                                st.session_state["ultimo_pn_caricato"] = pn_in
+                                st.session_state["ultima_desc_caricata"] = desc_in if desc_in else f"Articolo {pn_in}"
+                                st.session_state["ultima_ubic_caricata"] = ubic_in
+
+                                st.success(f"Operazione completata! Nuova giacenza per **{pn_in}**: **{nuova_qta} pz** (Zona: {zona_finale}).")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Errore operazione: {e}")
+                            finally:
+                                conn.close()
+
+            # Blocco opzioni di stampa per l'ultimo articolo registrato
+            if "ultimo_pn_caricato" in st.session_state:
+                st.markdown("---")
+                st.info(f"✨ Ultimo articolo registrato/caricato: **{st.session_state['ultimo_pn_caricato']}**. Scegli la modalità di stampa:")
+                
+                modalita_stampa = st.radio(
+                    "Modalità di stampa etichetta:", 
+                    ["📥 Scarica PDF Standard", "🏷️ Stampa Diretta su Stampante Termica (Zebra IP)"],
+                    horizontal=True,
+                    key="radio_modalita_stampa"
+                )
+                
+                if "PDF" in modalita_stampa:
+                    pdf_bytes_nuovo = genera_pdf_etichetta_singola(
+                        st.session_state["ultimo_pn_caricato"], 
+                        st.session_state["ultima_desc_caricata"], 
+                        st.session_state["ultima_ubic_caricata"]
+                    )
+                    st.download_button(
+                        label=f"🖨️ Scarica Etichetta PDF per {st.session_state['ultimo_pn_caricato']}",
+                        data=pdf_bytes_nuovo,
+                        file_name=f"Etichetta_{st.session_state['ultimo_pn_caricato']}.pdf",
+                        mime="application/pdf",
+                        type="primary"
+                    )
+                else:
+                    ip_attuale_global = st.session_state.get("ip_stampante_zebra_globale", "192.168.1.50")
+                    col_ip, col_btn_zpl = st.columns([2, 1])
+                    with col_ip:
+                        ip_zebra = st.text_input("Indirizzo IP Stampante Zebra:", value=ip_attuale_global, key="ip_zebra_input")
+                    with col_btn_zpl:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        if st.button("🚀 Invia a Stampante", type="primary"):
+                            zpl_string = genera_zpl_etichetta(
+                                st.session_state["ultimo_pn_caricato"], 
+                                st.session_state["ultima_desc_caricata"], 
+                                st.session_state["ultima_ubic_caricata"]
+                            )
+                            successo = invia_a_stampante_zebra(ip_zebra, zpl_string)
+                            if successo:
+                                st.success("Etichetta inviata con successo alla stampante termica!")
+                            else:
+                                st.error("Impossibile connettersi alla stampante. Verifica l'indirizzo IP.")
 
     # --- TAB 3: SOTTO SCORTA & RIORDINI ---
     with tab_sotto_scorta:
