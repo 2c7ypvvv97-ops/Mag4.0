@@ -657,3 +657,108 @@ def UPPER_EQ(s1, s2):
     if not s1 or not s2:
         return False
     return str(s1).strip().upper() == str(s2).strip().upper()
+    
+def importa_articoli_massivo(df_righe, mappatura_colonne, operatore: str):
+    """
+    Esegue l'import massivo degli articoli da un DataFrame mappato dinamicamente.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return False, "Errore di connessione al database."
+    
+    try:
+        cursor = conn.cursor()
+        inseriti = 0
+        aggiornati = 0
+        errori = 0
+
+        for _, row in df_righe.iterrows():
+            try:
+                # Estrazione e pulizia dati basata sulla mappatura scelta dall'utente
+                pn_col = mappatura_colonne.get('pn')
+                if not pn_col or pd.isna(row.get(pn_col)):
+                    errori += 1
+                    continue
+                
+                pn_codice = str(row[pn_col]).strip().upper()
+                if not pn_codice:
+                    errori += 1
+                    continue
+
+                descrizione = str(row[mappatura_colonne['descrizione']]).strip() if mappatura_colonne.get('descrizione') and not pd.isna(row.get(mappatura_colonne['descrizione'])) else f"Articolo {pn_codice}"
+                categoria = str(row[mappatura_colonne['categoria']]).strip() if mappatura_colonne.get('categoria') and not pd.isna(row.get(mappatura_colonne['categoria'])) else "Generico"
+                ubicazione = str(row[mappatura_colonne['ubicazione']]).strip().upper() if mappatura_colonne.get('ubicazione') and not pd.isna(row.get(mappatura_colonne['ubicazione'])) else "SCAFFALE-A1"
+                
+                zona_raw = str(row[mappatura_colonne['zona']]).strip().upper() if mappatura_colonne.get('zona') and not pd.isna(row.get(mappatura_colonne['zona'])) else "Generale"
+                zona = registra_zona_al_volo(zona_raw)
+
+                # Gestione numerica sicura
+                try:
+                    giacenza = int(float(row[mappatura_colonne['giacenza']])) if mappatura_colonne.get('giacenza') and not pd.isna(row.get(mappatura_colonne['giacenza'])) else 0
+                except Exception:
+                    giacenza = 0
+
+                try:
+                    prezzo = float(row[mappatura_colonne['prezzo']]) if mappatura_colonne.get('prezzo') and not pd.isna(row.get(mappatura_colonne['prezzo'])) else 0.0
+                except Exception:
+                    prezzo = 0.0
+
+                try:
+                    scorta_min = int(float(row[mappatura_colonne['scorta_minima']])) if mappatura_colonne.get('scorta_minima') and not pd.isna(row.get(mappatura_colonne['scorta_minima'])) else 5
+                except Exception:
+                    scorta_min = 5
+
+                fornitore = str(row[mappatura_colonne['fornitore']]).strip() if mappatura_colonne.get('fornitore') and not pd.isna(row.get(mappatura_colonne['fornitore'])) else ""
+
+                # Verifica se l'articolo esiste già per contare inseriti vs aggiornati
+                cursor.execute("SELECT pn_codice FROM part_numbers WHERE pn_codice = ?", (pn_codice,))
+                esiste = cursor.fetchone()
+
+                # Upsert anagrafica part_numbers
+                cursor.execute("""
+                    INSERT INTO part_numbers (pn_codice, descrizione, categoria, ubicazione, zona, scorta_minima, fornitore_abituale, prezzo_unitario)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(pn_codice) DO UPDATE SET
+                        descrizione = COALESCE(EXCLUDED.descrizione, part_numbers.descrizione),
+                        categoria = COALESCE(EXCLUDED.categoria, part_numbers.categoria),
+                        ubicazione = EXCLUDED.ubicazione,
+                        zona = EXCLUDED.zona,
+                        scorta_minima = EXCLUDED.scorta_minima,
+                        fornitore_abituale = COALESCE(EXCLUDED.fornitore_abituale, part_numbers.fornitore_abituale),
+                        prezzo_unitario = EXCLUDED.prezzo_unitario
+                """, (pn_codice, descrizione, categoria, ubicazione, zona, scorta_min, fornitore, prezzo))
+
+                # Upsert magazzino_quantita
+                cursor.execute("""
+                    INSERT INTO magazzino_quantita (pn_codice, quantita_disponibile, ubicazione, zona, operatore, data_ultimo_aggiornamento)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(pn_codice) DO UPDATE SET
+                        quantita_disponibile = EXCLUDED.quantita_disponibile,
+                        ubicazione = EXCLUDED.ubicazione,
+                        zona = EXCLUDED.zona,
+                        operatore = EXCLUDED.operatore,
+                        data_ultimo_aggiornamento = CURRENT_TIMESTAMP
+                """, (pn_codice, giacenza, ubicazione, zona, operatore))
+
+                # Registrazione audit trail storico
+                cursor.execute("""
+                    INSERT INTO storico_movimenti (pn_codice, tipo_movimento, quantita, causale, ubicazione, zona, operatore, note)
+                    VALUES (?, 'IMPORT_MASSIVO', ?, 'Importazione massiva iniziale file', ?, ?, ?, ?)
+                """, (pn_codice, giacenza, ubicazione, zona, operatore, f"Import file esterno (Prezzo: {prezzo})"))
+
+                if esiste:
+                    aggiornati += 1
+                else:
+                    inseriti += 1
+
+            except Exception as row_err:
+                print(f"Errore riga import: {row_err}")
+                errori += 1
+
+        conn.commit()
+        return True, f"Import completato con successo! Nuovi inseriti: {inseriti}, Aggiornati: {aggiornati}, Scartati/Errori: {errori}."
+    except Exception as e:
+        conn.rollback()
+        return False, f"Errore critico durante l'import massivo: {e}"
+    finally:
+        conn.close()

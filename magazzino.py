@@ -8,7 +8,8 @@ from db import (
     get_valore_totale_per_zona,
     get_articoli_in_ubicazione,
     esegui_trasferimento_singolo,
-    esegui_trasferimento_massivo
+    esegui_trasferimento_massivo,
+    importa_articoli_massivo
 )
 from clienti import get_tutti_clienti
 from etichette_pdf import genera_pdf_etichetta_singola, genera_pdf_lista_riordino
@@ -188,11 +189,12 @@ def render():
     num_critici = len(stock_sotto_scorta)
     badge_text = f" ⚠️ ({num_critici})" if num_critici > 0 else ""
 
-    tab_stock, tab_movimenti, tab_sotto_scorta, tab_storico = st.tabs([
+    tab_stock, tab_movimenti, tab_sotto_scorta, tab_storico, tab_import = st.tabs([
         "📋 Stock Live & Giacenze", 
         "🔄 Movimentazione (Carico/Scarico/Rettifica/Trasferimento)", 
         f"🚨 Sotto Scorta & Riordini{badge_text}",
-        "📜 Registro Movimenti"
+        "📜 Registro Movimenti",
+        "📥 Import Massivo Articoli"
     ])
 
     # --- TAB 1: STOCK LIVE ---
@@ -701,3 +703,69 @@ def render():
                 st.info("Nessun movimento registrato nel periodo selezionato.")
         else:
             st.info("💡 Seleziona l'intervallo di date desiderato e clicca su **'Carica Registro Storico'** per visualizzare i movimenti.")
+
+    # --- TAB 5: IMPORT MASSIVO ARTICOLI ---
+    with tab_import:
+        st.subheader("📥 Import Massivo Anagrafiche e Giacenze (CSV / Excel)")
+        st.markdown("Carica un file contenente i tuoi articoli storici. Potrai mappare le colonne del tuo file direttamente con i campi del gestionale.")
+
+        file_caricato = st.file_uploader("Seleziona file CSV o Excel (.xlsx)", type=["csv", "xlsx", "xls"], key="uploader_import_articoli")
+
+        if file_caricato is not None:
+            try:
+                if file_caricato.name.endswith('.csv'):
+                    df_file = pd.read_csv(file_caricato)
+                else:
+                    df_file = pd.read_excel(file_caricato)
+
+                st.success(f"File caricato con successo! Trovate **{len(df_file)} righe** e **{len(df_file.columns)} colonne**.")
+                
+                st.markdown("#### 🔍 Anteprima dei dati grezzi dal file:")
+                st.dataframe(df_file.head(5), use_container_width=True, hide_index=True)
+
+                st.markdown("#### 🗺️ Mappatura delle Colonne")
+                st.info("Associa le colonne del tuo file ai campi richiesti dal gestionale:")
+
+                colonne_disponibili = ["-- Non mappato / Salta --"] + list(df_file.columns)
+
+                col_m1, col_m2, col_m3 = st.columns(3)
+                with col_m1:
+                    map_pn = st.selectbox("Part Number (Codice Articolo) *", options=colonne_disponibili, index=1 if len(colonne_disponibili) > 1 else 0)
+                    map_desc = st.selectbox("Descrizione Articolo", options=colonne_disponibili)
+                    map_cat = st.selectbox("Categoria", options=colonne_disponibili)
+                with col_m2:
+                    map_ubic = st.selectbox("Ubicazione Magazzino", options=colonne_disponibili)
+                    map_zona = st.selectbox("Zona Logistica", options=colonne_disponibili)
+                    map_giac = st.selectbox("Quantità / Giacenza Iniziale", options=colonne_disponibili)
+                with col_m3:
+                    map_prezzo = st.selectbox("Prezzo Unitario (€)", options=colonne_disponibili)
+                    map_scorta = st.selectbox("Scorta Minima", options=colonne_disponibili)
+                    map_forn = st.selectbox("Fornitore Abituale", options=colonne_disponibili)
+
+                st.markdown("---")
+
+                if st.button("🚀 Avvia Importazione Massiva Articoli", type="primary", use_container_width=True):
+                    if map_pn == "-- Non mappato / Salta --":
+                        st.error("Il campo **Part Number (Codice Articolo)** è obbligatorio e deve essere associato a una colonna del file.")
+                    else:
+                        mappatura = {
+                            'pn': map_pn,
+                            'descrizione': map_desc if map_desc != "-- Non mappato / Salta --" else None,
+                            'categoria': map_cat if map_cat != "-- Non mappato / Salta --" else None,
+                            'ubicazione': map_ubic if map_ubic != "-- Non mappato / Salta --" else None,
+                            'zona': map_zona if map_zona != "-- Non mappato / Salta --" else None,
+                            'giacenza': map_giac if map_giac != "-- Non mappato / Salta --" else None,
+                            'prezzo': map_prezzo if map_prezzo != "-- Non mappato / Salta --" else None,
+                            'scorta_minima': map_scorta if map_scorta != "-- Non mappato / Salta --" else None,
+                            'fornitore': map_forn if map_forn != "-- Non mappato / Salta --" else None,
+                        }
+
+                        successo_imp, messaggio_imp = importa_articoli_massivo(df_file, mappatura, nome_operatore)
+                        if successo_imp:
+                            st.success(messaggio_imp)
+                            st.balloons()
+                        else:
+                            st.error(messaggio_imp)
+
+            except Exception as e:
+                st.error(f"Errore nella lettura del file: {e}")
