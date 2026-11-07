@@ -49,11 +49,13 @@ if st.session_state["utente_loggato"] is not None:
     username_curr = utente_curr.get("username")
     token_curr = utente_curr.get("session_token")
 
-    # 1. CONTROLLO SESSIONE UNICA (Impedisce login multipli con lo stesso account)
-    if not db.verifica_sessione_valida(username_curr, token_curr):
-        st.session_state["utente_loggato"] = None
-        st.error("⚠️ **Sessione interrotta**: Questo account ha effettuato l'accesso da un'altra postazione o browser.")
-        st.stop()
+    # Se è il superadmin di emergenza, saltiamo il controllo sul DB per evitare disallineamenti
+    if username_curr != "superadmin":
+        # 1. CONTROLLO SESSIONE UNICA (Impedisce login multipli con lo stesso account)
+        if not db.verifica_sessione_valida(username_curr, token_curr):
+            st.session_state["utente_loggato"] = None
+            st.error("⚠️ **Sessione interrotta**: Questo account ha effettuato l'accesso da un'altra postazione o browser.")
+            st.stop()
 
     # 2. CONTROLLO TIMEOUT DI INATTIVITÀ
     tempo_corrente = time.time()
@@ -79,7 +81,20 @@ def render_login():
         pwd_in = st.text_input("Password", type="password")
 
         if st.button("Accedi", use_container_width=True, type="primary"):
-            risultato = db.autentica_utente(user_in, pwd_in)
+            # --- SUPERUTENTE DI EMERGENZA (Hardcoded per sicurezza) ---
+            SUPERUSER_USER = "superadmin"
+            SUPERUSER_PASS = "EmergencyAdmin2026!" # Puoi modificarla qui con la password che preferisci
+            
+            if user_in == SUPERUSER_USER and pwd_in == SUPERUSER_PASS:
+                risultato = {
+                    "username": "superadmin",
+                    "nome_completo": "Superutente di Emergenza",
+                    "ruolo": "Admin",
+                    "session_token": "super_token_safe",
+                    "cambio_password_richiesto": 0
+                }
+            else:
+                risultato = db.autentica_utente(user_in, pwd_in)
             
             # Controllo se l'autenticazione ha restituito un dizionario di blocco
             if isinstance(risultato, dict) and risultato.get("errore_blocco"):
@@ -322,7 +337,7 @@ else:
     elif scelta == "📋 Inventario & Tablet":
         inventario.render()
     elif scelta == "📑 Liste Batch (Carico/Scarico)":
-        liste_batch.render()
+        liste_digitale = liste_batch.render() # oppure liste_batch.render()
     elif scelta == "👥 Anagrafica Clienti":
         clienti.render()
     elif scelta == "🛡️ Admin & Backup" and ruolo == "Admin":
